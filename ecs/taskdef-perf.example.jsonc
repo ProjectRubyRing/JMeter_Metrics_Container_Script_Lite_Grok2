@@ -1,0 +1,120 @@
+// =============================================================================
+// 性能試験用タスク定義の例 (pin 方式の docs/DESIGN.md 5 章のタスク定義に、性能試験用の差分を足したもの)
+//
+// ★ が性能試験用に足す・変える箇所。それ以外は本番のタスク定義のまま。
+//
+//   image       : --build-arg PERF_METRICS_ENABLED=true でビルドした性能試験用のタグ。
+//                 本番用イメージ (既定の false) には perf-metrics.sh が入っていない。
+//   /tmp        : jstat / jcmd が JVM に接続するために必要 (hsperfdata・アタッチ用のソケット)。
+//                 readonlyRootFilesystem=true では、書き込みできるボリュームを /tmp に当てる。
+//                 フロント / バックで「別の」ボリュームにすること (共有すると PID が重なり、
+//                 jstat / jcmd が別のコンテナの JVM を読む。perf-metrics.sh も WARN を出す)。
+//                 当てない場合も ① jboss-cli・③ top / ps / proc は動く (② の jstat / jcmd が止まる)。
+//   memory      : 収集用の JVM (jboss-cli 常駐・最大ヒープ 64MB、jstat 常駐 32MB、jcmd は間隔ごと)
+//                 で RSS 合計 200MB 前後増える。本番と同じヒープでメモリに余裕を持たせる。
+//   cpu         : ④ の判定 (-XX:ActiveProcessorCount の要否) は、タスクの cpu とコンテナの cpu
+//                 (CPU ユニット) から「このコンテナの取り分」を求める。コンテナの cpu を指定して
+//                 おくと判定が確実になる (未指定ならタスクの cpu ÷ JVM のコンテナ数)。
+//   environment : 間隔などを変えたいときだけ。書かなければイメージの既定 (ビルド引数 PERF_INTERVAL、
+//                 無ければ 10 秒)。PERF_METRICS_ENABLED=false で収集だけ止めることもできる。
+//   ECS Exec    : perf-metrics.sh status / cpu-check / threaddump / jfr-dump / pack を実行するときは、
+//                 サービス (update-service) または run-task に --enable-execute-command を付ける
+//                 (タスクロールに ssmmessages:CreateControlChannel など 4 つの権限が必要)。
+//                 initProcessEnabled=true は ECS Exec の推奨設定。
+//
+// 出力先: EFS の /mnt/logs/<Component_name>/logs/<Service_Name>/mid/<LOG_ID>/perf/
+//         (最後に起動したタスクの分は mid/current/perf/ から辿れる。例 /mnt/logs/front/logs/intra-web/mid/current/perf/)
+// 起動ログ (CloudWatch Logs) に「性能試験用メトリクス収集: 有効」と、①～④ の間隔・出力先が出る。
+// =============================================================================
+{
+  "family": "intra-web-perf",                                         // ★ 本番と分ける
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "2048",
+  "memory": "8192",                                                   // ★ 収集分の余裕 (コンテナごとに約 200MB)
+  "runtimePlatform": { "cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX" },
+  "containerDefinitions": [
+    {
+      "name": "intra-web-front",                                      // = Component_name (設計書の例)
+      "image": "<account>.dkr.ecr.ap-northeast-1.amazonaws.com/intra-web-front:perf",   // ★
+      "cpu": 1024,                                                    // ★ 取り分 1 vCPU (④ の判定に使う)
+      "memory": 4096,
+      "readonlyRootFilesystem": true,
+      "linuxParameters": { "initProcessEnabled": true },              // ★ ECS Exec の推奨
+      "environment": [
+        { "name": "Service_Name",     "value": "intra-web" },
+        { "name": "Component_name",   "value": "intra-web-front" },
+        { "name": "CONFIG_SEED_MODE", "value": "overwrite" },
+        { "name": "TZ",               "value": "Asia/Tokyo" },
+
+        // ★ 任意 (書かなければイメージの既定)
+        { "name": "PERF_INTERVAL",      "value": "10" },              // ①②③④ の既定の間隔 (秒)
+        { "name": "PERF_JCMD_INTERVAL", "value": "60" },              // jcmd (ヒープ詳細・スレッド状態) の間隔 (秒)
+        { "name": "PERF_TZ",            "value": "Asia/Tokyo" }       // CSV の timestamp 列のタイムゾーン
+        // { "name": "PERF_NMT",          "value": "summary" }        // ネイティブメモリも記録 (JVM が数 % 重くなる)
+        // { "name": "PERF_THREADDUMP",   "value": "full" }           // スレッドダンプの全文も保存
+        // { "name": "PERF_JFR",          "value": "false" }          // JFR を記録しない
+        // { "name": "PERF_METRICS_ENABLED", "value": "false" }       // 性能試験用イメージのまま収集だけ止める
+      ],
+      "secrets": [
+        { "name": "EXTRASLB_TRUSTSTORE_PASSWORD", "valueFrom": "arn:aws:secretsmanager:…" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "logs", "containerPath": "/mnt/logs" },
+        { "sourceVolume": "data", "containerPath": "/mnt/data" },
+        { "sourceVolume": "front-jboss-conf", "containerPath": "/opt/jboss-eap/standalone/configuration" },
+        { "sourceVolume": "front-jboss-tmp",  "containerPath": "/opt/jboss-eap/standalone/tmp" },
+        { "sourceVolume": "front-jboss-data", "containerPath": "/opt/jboss-eap/standalone/data" },
+        { "sourceVolume": "front-tmp",        "containerPath": "/tmp" }        // ★ jstat / jcmd 用
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/intra-web-perf",
+          "awslogs-region": "ap-northeast-1",
+          "awslogs-stream-prefix": "front",
+          "awslogs-create-group": "true"
+        }
+      }
+    },
+    {
+      "name": "intra-web-back",
+      "image": "<account>.dkr.ecr.ap-northeast-1.amazonaws.com/intra-web-back:perf",    // ★
+      "cpu": 1024,                                                    // ★
+      "memory": 4096,
+      "readonlyRootFilesystem": true,
+      "linuxParameters": { "initProcessEnabled": true },              // ★
+      "environment": [
+        { "name": "Service_Name",     "value": "intra-web" },
+        { "name": "Component_name",   "value": "intra-web-back" },
+        { "name": "CONFIG_SEED_MODE", "value": "overwrite" },
+        { "name": "TZ",               "value": "Asia/Tokyo" },
+        { "name": "PERF_TZ",          "value": "Asia/Tokyo" }         // ★ 任意
+      ],
+      "mountPoints": [
+        { "sourceVolume": "logs", "containerPath": "/mnt/logs" },
+        { "sourceVolume": "back-jboss-conf", "containerPath": "/opt/jboss-eap/standalone/configuration" },
+        { "sourceVolume": "back-jboss-tmp",  "containerPath": "/opt/jboss-eap/standalone/tmp" },
+        { "sourceVolume": "back-jboss-data", "containerPath": "/opt/jboss-eap/standalone/data" },
+        { "sourceVolume": "back-tmp",        "containerPath": "/tmp" }         // ★ front とは別のボリューム
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/intra-web-perf",
+          "awslogs-region": "ap-northeast-1",
+          "awslogs-stream-prefix": "back",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ],
+  "volumes": [
+    { "name": "logs", "efsVolumeConfiguration": { "fileSystemId": "fs-xxxx", "rootDirectory": "/logs-root" } },
+    { "name": "data", "efsVolumeConfiguration": { "fileSystemId": "fs-xxxx", "rootDirectory": "/data-root" } },
+    { "name": "front-jboss-conf" }, { "name": "front-jboss-tmp" }, { "name": "front-jboss-data" },
+    { "name": "back-jboss-conf"  }, { "name": "back-jboss-tmp"  }, { "name": "back-jboss-data"  },
+    { "name": "front-tmp" },                                          // ★ タスクスコープの空ボリューム
+    { "name": "back-tmp"  }                                           // ★
+  ]
+}

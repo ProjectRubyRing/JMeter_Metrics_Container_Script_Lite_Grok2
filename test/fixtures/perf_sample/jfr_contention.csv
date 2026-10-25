@@ -1,0 +1,12 @@
+rank,kind,class,site,count,total_ms,max_ms
+1,monitor-enter,java.lang.Object,org.apache.jsp.db_jsp._jspService,3291,537809.709,321.229
+2,thread-park,java.util.concurrent.Semaphore$FairSync,org.jboss.jca.core.connectionmanager.pool.api.Semaphore.tryAcquire,7456,249255.396,66.826
+3,thread-park,java.util.concurrent.CountDownLatch$Sync,org.jboss.as.controller.ParallelBootOperationStepHandler$ParallelBootTransactionControl.operationPrepared,75,60332.534,998.332
+4,thread-park,java.util.concurrent.CountDownLatch$Sync,org.jboss.as.controller.ParallelBootOperationStepHandler$2.execute,1,393.752,393.752
+5,thread-park,java.util.concurrent.FutureTask,org.jboss.as.controller.extension.ParallelExtensionAddHandler$1.execute,1,220.201,220.201
+6,thread-park,java.util.concurrent.FutureTask,org.jboss.as.controller.parsing.DeferredExtensionContext.load,4,165.415,67.929
+7,monitor-enter,org.apache.jasper.servlet.JspServletWrapper,org.apache.jasper.servlet.JspServletWrapper.getServlet,1,86.175,86.175
+8,monitor-enter,com.arjuna.common.util.propertyservice.PropertiesFactoryStax,com.arjuna.common.util.propertyservice.AbstractPropertiesFactory.initDefaultProperties,1,48.396,48.396
+9,monitor-enter,[I,org.jboss.as.clustering.controller.ResourceRegistrar.<init>,1,30.154,30.154
+10,monitor-enter,java.lang.Object,org.xnio.nio.WorkerThread.queueTask,1,26.837,26.837
+11,thread-park,java.util.concurrent.CountDownLatch$Sync,org.jboss.as.controller.ParallelBootOperationStepHandler.execute,1,23.927,23.927

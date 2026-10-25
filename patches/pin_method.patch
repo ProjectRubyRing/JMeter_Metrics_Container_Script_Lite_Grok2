@@ -1,0 +1,3102 @@
+diff --git a/docker/base/Dockerfile b/docker/base/Dockerfile
+--- a/docker/base/Dockerfile
++++ b/docker/base/Dockerfile
+@@ -7,6 +7,7 @@
+ # 全サービス・全コンポーネントで共通の仕込みだけを行う。
+ #   - EFS マウントポイント (/mnt/logs, /mnt/data) のディレクトリ作成
+ #   - readonlyRootFilesystem=true 対応のエントリポイントスクリプト配置
++#   - 性能試験用メトリクス収集 perf-metrics.sh の配置 (有効化は front / back のビルド引数)
+ #   - JBoss EAP の configuration を configuration-seed へ退避 (seed 方式)
+ #
+ # ビルド例:
+@@ -63,6 +64,15 @@
+ RUN chmod 0755 /usr/local/bin/efs-entrypoint.sh /usr/local/bin/efs-entrypoint-taskid.sh \
+     # Windows でチェックアウトされた場合の CRLF 混入対策
+     && sed -i 's/\r$//' /usr/local/bin/efs-entrypoint.sh /usr/local/bin/efs-entrypoint-taskid.sh
++
++# 性能試験用メトリクス収集 (perf-metrics.sh)。性能試験用の実装はこの 1 ファイルにまとめてある。
++# base では置くだけで動かない。使うかどうかは front / back のビルド引数
++# PERF_METRICS_ENABLED で決め、false (既定) なら front / back のビルドで削除する。
++# エントリポイントは PERF_METRICS_ENABLED=true のときだけこのファイルを読み込む。
++COPY perf-metrics.sh /usr/local/bin/perf-metrics.sh
++RUN chmod 0755 /usr/local/bin/perf-metrics.sh \
++    # Windows でチェックアウトされた場合の CRLF 混入対策
++    && sed -i 's/\r$//' /usr/local/bin/perf-metrics.sh
+ 
+ # ここに JBoss EAP 本体の導入やミドルウェア共通設定など、
+ # front / back 共通のレイヤーを追加する。
+diff --git a/docker/base/entrypoint.sh b/docker/base/entrypoint.sh
+--- a/docker/base/entrypoint.sh
++++ b/docker/base/entrypoint.sh
+@@ -32,6 +32,12 @@
+ #   6. JBoss を起動する (本番の entrypoint.sh と同じ分岐)。
+ #      CMD が eap なら standalone.sh を本番と同じ引数で起動し (3-B の pin を付ける)、
+ #      eap 以外なら CMD をそのまま exec する。
++#   6-B. (性能試験用イメージのみ) PERF_METRICS_ENABLED=true なら perf-metrics.sh を
++#      読み込み、メトリクスの収集をバックグラウンドで始める。実装はすべて
++#      perf-metrics.sh の 1 ファイルにあり、ここは読み込んで呼ぶだけ。
++#      統計の有効化 (-Dwildfly.*.statistics-enabled=true) を standalone.sh の引数に、
++#      JFR・NMT の JVM オプションを PREPEND_JAVA_OPTS に足す (JAVA_OPTS は変えない)。
++#      収集側で何が起きても JBoss の起動は止めない。
+ #
+ # 【なぜ fail-fast と事前検証にここまでこだわるのか】
+ #   JBoss EAP の起動時ロギングは
+@@ -148,6 +154,11 @@
+ #                       off = 従来どおり current 経由で書く。複数タスクが並走すると
+ #                             日付変更時のローテーションが他タスクのログを壊す。
+ #                             切り分け・再現試験以外では使わないこと
++#   PERF_METRICS_ENABLED : false (既定) | true
++#                       front / back のビルド引数 PERF_METRICS_ENABLED から ENV に焼き込む。
++#                       true = 性能試験用のメトリクス収集 (perf-metrics.sh) を起動時に始める。
++#                       イメージに perf-metrics.sh が無い (false でビルドした) ときは警告だけ。
++#                       収集の設定 (PERF_INTERVAL など) は perf-metrics.sh の先頭を参照
+ # =============================================================================
+ set -eu
+ 
+@@ -1020,5 +1031,50 @@
+     set -- "${_cmd}" "${PIN_OPT}" "$@"
+ fi
+ 
++# =============================================================================
++# 6-B. 性能試験用メトリクス収集 (ビルド引数 PERF_METRICS_ENABLED=true のイメージのみ)
++# =============================================================================
++# 実装は perf-metrics.sh の 1 ファイルにまとめている。有効なときだけ読み込み (.)、
++# 収集プロセスをバックグラウンドで起動する (JBoss の JVM が現れるのを待ってから取得する)。
++# 出力先は 3 で決めた実体ディレクトリ (JBOSS_LOG_DIR = mid/<LOG_ID>) の perf/。
++# 収集の開始に失敗しても JBoss の起動は続ける。
++PERF_METRICS_SCRIPT="${PERF_METRICS_SCRIPT:-/usr/local/bin/perf-metrics.sh}"
++case "${PERF_METRICS_ENABLED:-false}" in
++    true)
++        if [ -r "${PERF_METRICS_SCRIPT}" ]; then
++            # shellcheck disable=SC1090  # 読み込むのは /usr/local/bin/perf-metrics.sh (PERF_METRICS_SCRIPT で変更可)
++            . "${PERF_METRICS_SCRIPT}"
++            perf_metrics_start "$@" \
++                || echo "[efs-entrypoint] WARN: 性能試験用メトリクス収集を開始できませんでした (JBoss はそのまま起動します)" >&2
++            case "${1:-}" in
++                */standalone.sh|standalone.sh)
++                    # 統計を有効にする引数 (-Dwildfly.datasources / undertow / transactions .statistics-enabled=true)
++                    # を standalone.sh の直後へ足す (standalone.sh は '--' より後ろの引数を読まないため)
++                    if [ -n "${PERF_SERVER_OPTS:-}" ]; then
++                        _cmd="$1"; shift
++                        # shellcheck disable=SC2086
++                        set -- "${_cmd}" ${PERF_SERVER_OPTS} "$@"
++                    fi
++                    # JFR (-XX:StartFlightRecording) と NMT は JVM のオプションなので、standalone.sh が
++                    # JAVA_OPTS の前に足す PREPEND_JAVA_OPTS で渡す。JAVA_OPTS を空から設定すると
++                    # standalone.conf の既定値 (ヒープサイズ等) が効かなくなるため、JAVA_OPTS は変えない
++                    if [ -n "${PERF_PREPEND_JAVA_OPTS:-}" ]; then
++                        PREPEND_JAVA_OPTS="${PERF_PREPEND_JAVA_OPTS}${PREPEND_JAVA_OPTS:+ ${PREPEND_JAVA_OPTS}}"
++                        export PREPEND_JAVA_OPTS
++                    fi
++                    ;;
++            esac
++        else
++            echo "[efs-entrypoint] WARN: PERF_METRICS_ENABLED=true ですが ${PERF_METRICS_SCRIPT} がありません。" >&2
++            echo "[efs-entrypoint] WARN: このイメージは PERF_METRICS_ENABLED=false でビルドされています。収集するには --build-arg PERF_METRICS_ENABLED=true で再ビルドしてください" >&2
++        fi
++        ;;
++    false|"")
++        ;;
++    *)
++        echo "[efs-entrypoint] WARN: PERF_METRICS_ENABLED の値が不正です: '${PERF_METRICS_ENABLED}' (true|false)。性能試験用メトリクス収集は行いません" >&2
++        ;;
++esac
++
+ say "preflight OK. starting: $(mask_args "$@")"
+ exec "$@"
+diff --git a/docker/base/perf-metrics.sh b/docker/base/perf-metrics.sh
+new file mode 100755
+--- /dev/null
++++ b/docker/base/perf-metrics.sh
+@@ -0,0 +1,2877 @@
++#!/bin/sh
++# =============================================================================
++# perf-metrics.sh
++#
++# 性能試験 (JMeter など) の間、ECS タスク (Fargate) のコンテナで動く JBoss EAP 8.1 /
++# Red Hat build of OpenJDK 21 (UBI 9.8) から、CloudWatch Container Insights (拡張
++# オブザーバビリティ) では見えない値だけを一定間隔で取得し、readonlyRootFilesystem=true
++# でも書き込める EFS 上のタスク専用ディレクトリへ CSV で書き出す。
++#
++#   ① jboss-cli : DB 接続プール (データソース / XA データソースの statistics=pool。XA の
++#                 commit / prepare / rollback を含む)、HTTP リスナー (リクエスト数・エラー数・
++#                 処理時間)、HTTP セッション、IO ワーカー (リクエスト処理スレッドの使用数・
++#                 キュー・接続数)、EJB / EE スレッドプール、トランザクション、
++#                 JVM (スレッド数・クラス数・ダイレクトバッファ・サーバーの状態)
++#   ② jstat     : ヒープ各領域・GC 回数 / 時間・直近の GC の原因・セーフポイント・スレッド数・
++#                 クラス数・JIT 時間 (カスタムオプション perfgc の常駐 1 プロセス)
++#      jcmd      : ヒープ・メタスペースの詳細 (GC.heap_info)・コードキャッシュ
++#                 (Compiler.codecache)・スレッドの状態 (Thread.print の集計)・
++#                 ネイティブメモリ (VM.native_memory。PERF_NMT=summary のとき)
++#      JFR       : Flight Recorder を JBoss の起動時から記録 (統計イベントは PERF_JFR_INTERVAL
++#                 秒間隔)。perf-metrics.sh jfr-csv で GC 個別・CPU・ロック待ち・I/O 待ち・
++#                 ホットメソッド等の CSV にする
++#   ③ top / ps  : プロセス別・JBoss のスレッド別の CPU、ロードアベレージ・steal、プロセス一覧。
++#                 JBoss のスレッドを用途 (GC・JIT・HTTP 処理など) 別にまとめた CPU と状態、
++#                 FD 数・TCP 接続 (状態・接続先ポート)。top / ps (procps-ng) が無い
++#                 イメージでは /proc から同じ項目を算出する
++#   ④ CPU 数    : -XX:ActiveProcessorCount の要否の判断材料 (ECS の CPU 割り当て・OS / cgroup
++#                 から見える CPU・JVM が認識した CPU 数と、それで決まる GC / JIT スレッド数)
++#                 と判定 (cpu_env.csv)。CPU の待ち・steal・スロットリングの推移 (cpu_sched.csv)
++#
++#   Container Insights (拡張) で見られるコンテナ / タスクの CPU 使用率・メモリ使用量・
++#   ネットワーク / ストレージの転送量・再起動回数・ヘルスチェックは取得しない。
++#
++# 性能試験用の実装はこの 1 ファイルにまとめている。
++#   ビルド時: front / back の Dockerfile が、ビルド引数 PERF_METRICS_ENABLED=true の
++#             ときだけこのファイルを残し `perf-metrics.sh install` で必要なコマンドを確かめる
++#             (top / ps が無ければ procps-ng の導入を試みる。導入できなくても /proc で代替)。
++#             false (既定) ならファイルを削除する (本番と同じ中身になる)。
++#   起動時  : efs-entrypoint.sh が PERF_METRICS_ENABLED=true のときだけこのファイルを
++#             読み込み (.) perf_metrics_start を呼ぶ。収集は別プロセスで行い、
++#             JBoss の起動を待たせない。収集側で何が起きても JBoss の起動は止めない。
++#             JBoss に足す JVM オプション (JFR・NMT) は PREPEND_JAVA_OPTS で渡し、
++#             JAVA_OPTS (= standalone.conf の既定ヒープ等) は変えない。
++#
++# 【出力先】 (readonlyRootFilesystem=true でも書き込める場所)
++#   JBoss のログと同じタスク専用ディレクトリの下の perf/ に書く。
++#     /mnt/logs/<Component_name>/logs/<Service_Name>/mid/<LOG_ID>/perf/
++#     例) /mnt/logs/front/logs/intra-web/mid/current/perf/
++#         (current はエントリポイントが「最後に起動したタスクの <LOG_ID>」へ張る目印)
++#   current は全タスクが共有して張り替えるリンクなので、書き込みの経路には使わない
++#   (server.log を実体パスへ固定 (pin) しているのと同じ理由。docs/LOG_ROTATION.md)。
++#   エントリポイントが決めた実体パス JBOSS_LOG_DIR (= mid/<LOG_ID>) を使い、取れない
++#   ときだけ起動時点の current を実体パスに解決して使う。
++#   FIFO・PID ファイルなどの作業ファイルはタスクローカルの書き込み可能領域
++#   (/tmp → standalone/tmp → 出力先/.work の順に、書けるところ) に置く。
++#
++# 【出力ファイル】 (UTF-8・LF・1 行目が見出しの CSV。timestamp はコンテナの TZ、epoch は UNIX 秒)
++#   perf_meta.csv / collector.log       収集条件・環境 (category,key,value) / 収集プロセスのログ
++#   ① cli_datasource.csv  cli_undertow.csv  cli_session.csv  cli_io_worker.csv
++#      cli_threadpool.csv  cli_transactions.csv  cli_jvm.csv
++#   ② jvm_jstat_gc.csv  jvm_jcmd_heap.csv  jvm_codecache.csv  jvm_thread_states.csv
++#      jvm_nmt.csv (PERF_NMT=summary)  jvm_info.txt  threaddump/ (PERF_THREADDUMP=full)
++#      jfr/perf_<pid>_<日時>.jfr (JBoss 終了時)  jfr/repo/ (記録中のチャンク)
++#      jfr_*.csv (perf-metrics.sh jfr-csv / pack の後)
++#   ③ os_top_summary.csv  os_top_process.csv  os_top_threads.csv  os_top.log  os_ps.csv
++#      os_jboss_threads.csv  os_jboss_proc.csv
++#   ④ cpu_env.csv  cpu_sched.csv
++#
++# 【使い方】
++#   ビルド    : docker build --build-arg PERF_METRICS_ENABLED=true ... docker/front
++#   起動      : 何もしなくてよい (エントリポイントが起動時に読み込む)
++#   状態確認  : perf-metrics.sh status            (ECS Exec でコンテナに入って実行)
++#   ④ の判定  : perf-metrics.sh cpu-check
++#   停止      : perf-metrics.sh stop              (収集を止める。JFR は JBoss 側で記録を続ける)
++#   JFR       : perf-metrics.sh jfr-dump | jfr-csv
++#   スレッド  : perf-metrics.sh threaddump        (その場で 1 回取得)
++#   まとめる  : perf-metrics.sh pack              (jfr-csv の後、perf/ を tar 1 ファイルにする)
++#   レポート  : perf/ を Windows に持ってきて New-PerfMetricsReport.ps1 で Excel にする
++#
++# 【設定】 (環境変数。ビルド時の ENV・タスク定義の environment のどちらでも指定できる)
++#   PERF_METRICS_ENABLED     true | false     収集するか (ビルド引数から ENV に焼き込む)
++#   PERF_INTERVAL            10               各収集の既定の間隔 (秒)
++#   PERF_CLI_INTERVAL        PERF_INTERVAL    ① jboss-cli の間隔 (秒)
++#   PERF_JSTAT_INTERVAL      PERF_INTERVAL    ② jstat の間隔 (秒)
++#   PERF_JCMD_INTERVAL       60               ② jcmd の間隔 (秒。1 回ごとに JVM を起動するため長め)
++#   PERF_JFR_INTERVAL        PERF_INTERVAL    ② JFR の統計イベント (CPU 負荷・スレッド数など) の間隔 (秒)
++#   PERF_TOP_INTERVAL        PERF_INTERVAL    ③ top の間隔 (秒)
++#   PERF_PS_INTERVAL         PERF_INTERVAL    ③ ps の間隔 (秒)
++#   PERF_PROC_INTERVAL       PERF_INTERVAL    ③④ JBoss のスレッド別 CPU・FD・TCP、CPU の待ちの間隔 (秒)
++#   PERF_COLLECTORS          "cli jstat jcmd top ps proc"   動かす収集 (空白区切り)
++#   PERF_OUTPUT_DIR / PERF_WORK_DIR   (自動)  出力先 / 作業ディレクトリを明示するとき
++#   PERF_TZ                  (コンテナの TZ)  タイムスタンプのタイムゾーン (例 Asia/Tokyo)
++#   PERF_ENABLE_STATISTICS   true             standalone.sh に -Dwildfly.datasources / undertow /
++#                                             transactions .statistics-enabled=true を足す
++#   PERF_CLI_ENABLE_DS_STATS true             それでもプール統計が無効なデータソースを実行時に有効化
++#   PERF_CLI_CONTROLLER      (自動)           例 remote+http://127.0.0.1:9990
++#   PERF_CLI_USER / PERF_CLI_PASSWORD         ローカル認証が使えないときの管理ユーザー
++#   PERF_CLI_TIMEOUT         30               1 回の取得のタイムアウト (秒)
++#   PERF_CLI_HEAP            64m              jboss-cli の最大ヒープ
++#   PERF_JFR                 true             JFR を記録する (true | false)
++#   PERF_JFR_SETTINGS        default          default | profile | .jfc のパス
++#   PERF_JFR_MAXAGE / PERF_JFR_MAXSIZE  24h / 1g   JFR を残す最大の時間 / 大きさ
++#   PERF_NMT                 off              summary にすると -XX:NativeMemoryTracking=summary を
++#                                             足し、jcmd VM.native_memory を記録する (JVM が数 % 重くなる)
++#   PERF_THREADDUMP          summary          off | summary (状態を集計) | full (集計 + 全文を保存)
++#   PERF_TOP_THREADS         10               JBoss のスレッド別 CPU を上位何件記録するか (0 = 取らない)
++#   PERF_TOP_RAW             true             top の出力そのものを os_top.log に残すか
++#   PERF_JVM_CONTAINERS      (自動)           ④ タスク内で JVM が動くコンテナの数 (自動判定を上書き)
++#   PERF_WAIT_TIMEOUT        900              JBoss の JVM / 管理インタフェースを待つ秒数
++#   PERF_PROCPS              auto             ビルド時: auto | true | false (procps-ng の導入。
++#                                             true は導入できなければビルドを失敗させる)
++#
++# 【注意】
++#   - 収集用に jboss-cli (常駐 1 つ・最大ヒープ 64MB)、jstat (常駐 1 つ・32MB) の JVM と
++#     top が増え、jcmd は PERF_JCMD_INTERVAL ごとに短時間 JVM を起動する。RSS で合計
++#     200MB 前後を見込み、タスクのメモリに余裕を持たせること。JFR (default) は 1% 程度。
++#   - jstat / jcmd は /tmp (hsperfdata・アタッチ用ソケット) が書き込めないと JVM に
++#     接続できない。readonlyRootFilesystem=true では /tmp にボリュームを当てること
++#     (フロント / バックで別のボリュームにする。共有すると PID が重なり別の JVM を読む)。
++#   - 本ファイルは /bin/sh (POSIX) で動く。エントリポイント (set -eu) から読み込まれる
++#     ため、トップレベルでは関数と既定値の定義しか行わない。
++# =============================================================================
++
++PERF_METRICS_VERSION="3.0.0"
++
++# --- 既定値 (エントリポイントから読み込まれても安全な代入だけ) ------------------
++: "${PERF_METRICS_ENABLED:=false}"
++: "${PERF_INTERVAL:=10}"
++: "${PERF_CLI_INTERVAL:=${PERF_INTERVAL}}"
++: "${PERF_JSTAT_INTERVAL:=${PERF_INTERVAL}}"
++: "${PERF_JCMD_INTERVAL:=60}"
++: "${PERF_JFR_INTERVAL:=${PERF_INTERVAL}}"
++: "${PERF_TOP_INTERVAL:=${PERF_INTERVAL}}"
++: "${PERF_PS_INTERVAL:=${PERF_INTERVAL}}"
++: "${PERF_PROC_INTERVAL:=${PERF_INTERVAL}}"
++: "${PERF_COLLECTORS:=cli jstat jcmd top ps proc}"
++: "${PERF_OUTPUT_DIR:=}"
++: "${PERF_WORK_DIR:=}"
++: "${PERF_TZ:=}"
++: "${PERF_ENABLE_STATISTICS:=true}"
++: "${PERF_CLI_ENABLE_DS_STATS:=true}"
++: "${PERF_CLI_CONTROLLER:=}"
++: "${PERF_CLI_USER:=}"
++: "${PERF_CLI_PASSWORD:=}"
++: "${PERF_CLI_TIMEOUT:=30}"
++: "${PERF_CLI_CONNECT_TIMEOUT:=60}"
++: "${PERF_CLI_HEAP:=64m}"
++: "${PERF_JFR:=true}"
++: "${PERF_JFR_SETTINGS:=default}"
++: "${PERF_JFR_MAXAGE:=24h}"
++: "${PERF_JFR_MAXSIZE:=1g}"
++: "${PERF_NMT:=off}"
++: "${PERF_THREADDUMP:=summary}"
++: "${PERF_TOP_THREADS:=10}"
++: "${PERF_TOP_RAW:=true}"
++: "${PERF_JVM_CONTAINERS:=}"
++: "${PERF_WAIT_TIMEOUT:=900}"
++: "${PERF_PROCPS:=auto}"
++: "${PERF_TOOL_JAVA_OPTS:=-Xms8m -Xmx32m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -XX:-UsePerfData -Xss512k}"
++
++# エントリポイントが standalone.sh の直後へ足す引数 (統計の有効化)。
++# 標準の構成は statistics-enabled="${wildfly.<サブシステム>.statistics-enabled:${wildfly.statistics-enabled:false}}"
++# の式を使っているため、このシステムプロパティで起動時から統計が有効になる
++# (式を使っていないデータソースは ① が実行時に有効化する)。取得しない EJB などの
++# 統計は有効にしない (余計な負荷をかけない)。
++PERF_SERVER_OPTS=""
++if [ "${PERF_ENABLE_STATISTICS}" = "true" ]; then
++    PERF_SERVER_OPTS="-Dwildfly.datasources.statistics-enabled=true -Dwildfly.undertow.statistics-enabled=true -Dwildfly.transactions.statistics-enabled=true"
++fi
++# JBoss の JVM に足すオプション (JFR・NMT)。perf_metrics_start が出力先を決めてから設定し、
++# エントリポイントが PREPEND_JAVA_OPTS (standalone.sh が JAVA_OPTS の前に足す) へ渡す。
++PERF_PREPEND_JAVA_OPTS=""
++
++PM_SELF="${PERF_METRICS_SCRIPT:-/usr/local/bin/perf-metrics.sh}"
++
++# パスワードらしき値を伏せる (起動コマンド・ps / top・JVM 引数の出力用 sed 式)
++PM_MASK_SED='s/\([A-Za-z0-9_.-]*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][A-Za-z0-9_.-]*[=:]\)[^ ,]*/\1********/g'
++# タブ (「キー<TAB>値」の受け渡しに使う。ソースにタブ文字を直接書かないため)
++PM_TAB="$(printf '\t')"
++
++# =============================================================================
++# 共通ヘルパー
++# =============================================================================
++pm_say() {
++    printf '[perf-metrics] %s\n' "$*"
++}
++
++# ログ: collector.log へ。WARN / ERROR / RESULT は標準エラー (CloudWatch Logs) にも出す。
++pm_log() {
++    _pm_ll="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) [perf-metrics] [${PM_NAME:-main}] $1 $2"
++    if [ -n "${PM_LOG_FILE:-}" ]; then
++        printf '%s\n' "${_pm_ll}" >> "${PM_LOG_FILE}" 2>/dev/null
++    fi
++    case "$1" in
++        WARN|ERROR|RESULT) printf '%s\n' "${_pm_ll}" >&2 ;;
++    esac
++    return 0
++}
++
++# 同じ警告を何度も出さない (キーごとに 1 回)
++pm_warn_once() {  # key message
++    case " ${PM_WARNED:-} " in
++        *" $1 "*) return 0 ;;
++    esac
++    PM_WARNED="${PM_WARNED:-} $1"
++    pm_log WARN "$2"
++}
++
++pm_is_uint() {
++    case "$1" in
++        ""|*[!0-9]*) return 1 ;;
++    esac
++    return 0
++}
++
++# 正の整数でなければ既定値に戻す
++pm_uint_or() {  # value default
++    if pm_is_uint "$1" && [ "$1" -gt 0 ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
++}
++
++# ディレクトリへ実際に書き込めるか (EROFS / EACCES の両方を実書き込みで判定)
++pm_is_writable() {
++    [ -d "$1" ] || return 1
++    _pm_probe="$1/.perf-metrics-writetest.$$"
++    if ( : > "${_pm_probe}" ) 2>/dev/null; then
++        rm -f "${_pm_probe}" 2>/dev/null
++        return 0
++    fi
++    return 1
++}
++
++# 現在時刻: PM_TS (YYYY-MM-DD HH:MM:SS) と PM_EPOCH (UNIX 秒)
++pm_now() {
++    _pm_n="$(date '+%Y-%m-%d %H:%M:%S|%s')"
++    PM_TS="${_pm_n%|*}"
++    PM_EPOCH="${_pm_n#*|}"
++}
++
++pm_ms() {
++    _pm_v="$(date +%s%N 2>/dev/null)"
++    case "${_pm_v}" in
++        *N*|"") echo $(( $(date +%s) * 1000 )) ;;
++        *) echo $(( _pm_v / 1000000 )) ;;
++    esac
++}
++
++# 次の「間隔の倍数の時刻」まで待つ (各収集の時刻をそろえる)
++pm_sleep_tick() {  # interval
++    _pm_s="$(date +%s)"
++    sleep $(( $1 - _pm_s % $1 ))
++}
++
++# CSV ファイルが無い (または空) なら見出し行を書く
++pm_csv_init() {  # file header
++    if [ ! -s "$1" ]; then
++        printf '%s\n' "$2" >> "$1"
++    fi
++}
++
++pm_meta() {  # category key value
++    if [ -n "${PM_OUT:-}" ]; then
++        printf '%s,%s,%s\n' "$1" "$2" "$(printf '%s' "$3" | tr '\n' ' ' | sed -e 's/"/""/g' -e 's/^/"/' -e 's/$/"/')" \
++            >> "${PM_OUT}/perf_meta.csv" 2>/dev/null
++    fi
++    return 0
++}
++
++# タイムスタンプのタイムゾーン。tzdata が無いイメージでも Asia/Tokyo は JST-9 で代替する。
++pm_setup_tz() {
++    case "${PERF_TZ}" in
++        "") ;;
++        UTC|utc) TZ=UTC0; export TZ ;;
++        JST|jst|Asia/Tokyo)
++            if [ -e /usr/share/zoneinfo/Asia/Tokyo ]; then TZ=Asia/Tokyo; else TZ=JST-9; fi
++            export TZ ;;
++        *) TZ="${PERF_TZ}"; export TZ ;;
++    esac
++}
++
++# JBoss EAP サーバー JVM の PID (java で、jboss-modules.jar と org.jboss.as.standalone を含む)
++pm_find_jboss_pid() {
++    for _pm_d in /proc/[0-9]*; do
++        [ -r "${_pm_d}/cmdline" ] || continue
++        _pm_c="$(tr '\0' ' ' 2>/dev/null < "${_pm_d}/cmdline")" || continue
++        case "${_pm_c}" in
++            *org.jboss.as.cli*) continue ;;
++            *jboss-modules.jar*org.jboss.as.standalone*) ;;
++            *) continue ;;
++        esac
++        _pm_a0="${_pm_c%% *}"
++        case "${_pm_a0##*/}" in
++            java|java.*) printf '%s\n' "${_pm_d#/proc/}"; return 0 ;;
++        esac
++    done
++    return 1
++}
++
++# JBoss の JVM が現れるまで待つ (PERF_WAIT_TIMEOUT 秒)。PM_JPID に入れる。
++pm_wait_jboss() {
++    _pm_dl=$(( $(date +%s) + PERF_WAIT_TIMEOUT ))
++    until PM_JPID="$(pm_find_jboss_pid)"; do
++        if [ "$(date +%s)" -ge "${_pm_dl}" ]; then
++            pm_log WARN "JBoss EAP の JVM が ${PERF_WAIT_TIMEOUT} 秒たっても見つかりません。この収集 (${PM_NAME}) を終了します"
++            return 1
++        fi
++        sleep 2
++    done
++}
++
++pm_jboss_alive() {
++    [ -n "${PM_JPID:-}" ] && [ -r "/proc/${PM_JPID}/cmdline" ] && \
++        tr '\0' ' ' 2>/dev/null < "/proc/${PM_JPID}/cmdline" | grep -q 'org.jboss.as.standalone'
++}
++
++# JBoss の JVM が使っている java の実体 (収集用の JVM も同じ JDK を使う)
++pm_java_of_jboss() {
++    _pm_j=""
++    if [ -n "${PM_JPID:-}" ]; then
++        _pm_j="$(readlink "/proc/${PM_JPID}/exe" 2>/dev/null)"
++    fi
++    if [ -z "${_pm_j}" ] || [ ! -x "${_pm_j}" ]; then
++        if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
++            _pm_j="${JAVA_HOME}/bin/java"
++        else
++            _pm_j="$(command -v java 2>/dev/null)"
++        fi
++    fi
++    [ -n "${_pm_j}" ] || return 1
++    printf '%s\n' "${_pm_j}"
++}
++
++# jstat / jcmd の起動方法を決める。PM_TOOL_BIN (実行ファイル) か PM_TOOL_MAIN (java -m の主クラス)。
++#   1) JBoss と同じ JDK の bin  2) PATH  3) java -m jdk.jcmd/<主クラス>
++#   (Red Hat の OpenJDK 21 runtime イメージは jcmd はあるが jstat は無い。jdk.jcmd
++#    モジュールは入っているので java -m で jstat を起動できる)
++pm_resolve_tool() {  # jstat | jcmd
++    PM_TOOL_BIN=""; PM_TOOL_MAIN=""; PM_TOOL_NAME="$1"
++    PM_TOOL_JAVA="$(pm_java_of_jboss)" || PM_TOOL_JAVA=""
++    if [ -n "${PM_TOOL_JAVA}" ]; then
++        _pm_jb="$(readlink -f "${PM_TOOL_JAVA}" 2>/dev/null || printf '%s' "${PM_TOOL_JAVA}")"
++        if [ -x "${_pm_jb%/java}/$1" ]; then PM_TOOL_BIN="${_pm_jb%/java}/$1"; return 0; fi
++    fi
++    if command -v "$1" >/dev/null 2>&1; then PM_TOOL_BIN="$(command -v "$1")"; return 0; fi
++    if [ -n "${PM_TOOL_JAVA}" ] && \
++       env -u JAVA_TOOL_OPTIONS -u _JAVA_OPTIONS -u JDK_JAVA_OPTIONS "${PM_TOOL_JAVA}" -XX:-UsePerfData --list-modules 2>/dev/null \
++       | grep -q '^jdk\.jcmd@'; then
++        case "$1" in
++            jstat) PM_TOOL_MAIN="sun.tools.jstat.Jstat" ;;
++            jcmd)  PM_TOOL_MAIN="sun.tools.jcmd.JCmd" ;;
++        esac
++        [ -n "${PM_TOOL_MAIN}" ] && return 0
++    fi
++    return 1
++}
++
++pm_tool_desc() {
++    if [ -n "${PM_TOOL_BIN}" ]; then printf '%s' "${PM_TOOL_BIN}"; else printf '%s -m jdk.jcmd/%s' "${PM_TOOL_JAVA}" "${PM_TOOL_MAIN}"; fi
++}
++
++# 解決したツールを、アプリ用の JVM オプション (javaagent 等) を外して起動する。
++# PM_TOOL_SYSPROPS に -D... を入れると、ツールの JVM のシステムプロパティとして渡す。
++pm_tool_exec() {  # args...
++    (
++        unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS JAVA_OPTS
++        LC_ALL=C; export LC_ALL
++        # -Dperf.metrics.collector は目印 (ps / top で手動実行の jstat / jcmd と区別するため)
++        _pm_mark="-Dperf.metrics.collector=${PM_TOOL_NAME:-tool}"
++        if [ -n "${PM_TOOL_BIN}" ]; then
++            _pm_jo="-J${_pm_mark}"
++            for _pm_o in ${PERF_TOOL_JAVA_OPTS} ${PM_TOOL_SYSPROPS:-}; do _pm_jo="${_pm_jo} -J${_pm_o}"; done
++            # shellcheck disable=SC2086
++            exec "${PM_TOOL_BIN}" ${_pm_jo} "$@"
++        fi
++        # shellcheck disable=SC2086
++        exec "${PM_TOOL_JAVA}" "${_pm_mark}" ${PERF_TOOL_JAVA_OPTS} ${PM_TOOL_SYSPROPS:-} -m "jdk.jcmd/${PM_TOOL_MAIN}" "$@"
++    )
++}
++
++# hsperfdata (jstat が読む性能カウンタ) が /tmp にあるか
++pm_hsperf_exists() {  # pid
++    for _pm_h in /tmp/hsperfdata_*/"$1"; do
++        [ -e "${_pm_h}" ] && return 0
++    done
++    return 1
++}
++
++# 指定 PID とその子孫を止める
++pm_kill_tree() {  # pid
++    _pm_list=" $1 "
++    _pm_pass=0
++    while [ "${_pm_pass}" -lt 3 ]; do
++        for _pm_d in /proc/[0-9]*; do
++            _pm_st="$(cat "${_pm_d}/stat" 2>/dev/null)" || continue
++            _pm_st="${_pm_st##*) }"
++            # shellcheck disable=SC2086
++            set -- ${_pm_st}
++            case "${_pm_list}" in
++                *" $2 "*)
++                    case "${_pm_list}" in *" ${_pm_d#/proc/} "*) ;; *) _pm_list="${_pm_list}${_pm_d#/proc/} " ;; esac
++                    ;;
++            esac
++        done
++        _pm_pass=$((_pm_pass + 1))
++    done
++    # shellcheck disable=SC2086
++    kill -TERM ${_pm_list} 2>/dev/null
++    sleep 1
++    # shellcheck disable=SC2086
++    kill -KILL ${_pm_list} 2>/dev/null
++    return 0
++}
++
++# 作業ディレクトリの候補 (タスクローカルで書ける所)。同じタスクのフロント / バックが
++# /tmp を共有していてもぶつからないよう、コンポーネント名を名前に入れる。
++pm_work_candidates() {
++    _pm_wsfx="$(printf '%s' "${Component_name:-}" | tr -c 'A-Za-z0-9._-' '_')"
++    [ -n "${PERF_WORK_DIR}" ] && printf '%s\n' "${PERF_WORK_DIR}"
++    printf '%s\n' "/tmp/perf-metrics${_pm_wsfx:+-${_pm_wsfx}}"
++    printf '%s\n' "${JBOSS_HOME:-/opt/jboss-eap}/standalone/tmp/perf-metrics"
++    [ -n "${PM_OUT:-}" ] && printf '%s\n' "${PM_OUT}/.work"
++    return 0
++}
++
++# 状態ファイル (status / stop / pack が使う) を探して読み込む
++pm_load_state() {
++    for _pm_w in $(pm_work_candidates); do
++        if [ -r "${_pm_w}/perf-metrics.state" ]; then
++            # shellcheck disable=SC1090
++            . "${_pm_w}/perf-metrics.state"
++            return 0
++        fi
++    done
++    return 1
++}
++
++pm_has_collector() {
++    case " ${PERF_COLLECTORS} " in *" $1 "*) return 0 ;; esac
++    return 1
++}
++
++# =============================================================================
++# 起動 (efs-entrypoint.sh から呼ばれる)
++# =============================================================================
++# 出力先を決める。成功したら PM_OUT に入れる。
++pm_resolve_output_dir() {
++    PM_OUT=""
++    PM_OUT_NOTE=""
++    if [ -n "${PERF_OUTPUT_DIR}" ]; then
++        PM_OUT="${PERF_OUTPUT_DIR}"
++        PM_OUT_NOTE="PERF_OUTPUT_DIR で指定"
++    elif [ -n "${JBOSS_LOG_DIR:-}" ] && [ -d "${JBOSS_LOG_DIR}" ]; then
++        # エントリポイントが決めた、このタスク専用の実体ディレクトリ (mid/<LOG_ID>)
++        PM_OUT="${JBOSS_LOG_DIR}/perf"
++        PM_OUT_NOTE="JBoss のログと同じタスク専用ディレクトリ"
++    elif [ -n "${EFS_LOG_DIR:-}" ] && [ -d "${EFS_LOG_DIR}/mid/current" ]; then
++        # 起動時点の current を実体パスへ解決する (以後 current が張り替わっても影響しない)
++        _pm_cur="$(cd "${EFS_LOG_DIR}/mid/current" 2>/dev/null && pwd -P)"
++        [ -n "${_pm_cur}" ] && PM_OUT="${_pm_cur}/perf"
++        PM_OUT_NOTE="起動時点の mid/current を実体パスへ解決"
++    elif [ -d "${JBOSS_HOME:-/opt/jboss-eap}/standalone/log" ]; then
++        _pm_cur="$(cd "${JBOSS_HOME:-/opt/jboss-eap}/standalone/log" 2>/dev/null && pwd -P)"
++        [ -n "${_pm_cur}" ] && PM_OUT="${_pm_cur}/perf"
++        PM_OUT_NOTE="standalone/log の解決先"
++    fi
++    [ -n "${PM_OUT}" ] || return 1
++    mkdir -p "${PM_OUT}" 2>/dev/null
++    pm_is_writable "${PM_OUT}"
++}
++
++pm_resolve_work_dir() {
++    PM_W=""
++    for _pm_w in $(pm_work_candidates); do
++        mkdir -p "${_pm_w}" 2>/dev/null || continue
++        if pm_is_writable "${_pm_w}"; then PM_W="${_pm_w}"; return 0; fi
++    done
++    return 1
++}
++
++# ECS タスクメタデータ (v4) を取る。PM_ECS_TASK / PM_ECS_CONT に「パス<TAB>値」の行で入れる。
++pm_ecs_fetch() {
++    PM_ECS_TASK=""; PM_ECS_CONT=""
++    [ -n "${ECS_CONTAINER_METADATA_URI_V4:-}" ] || return 1
++    command -v curl >/dev/null 2>&1 || return 1
++    _pm_j="$(curl -fsS --max-time 3 "${ECS_CONTAINER_METADATA_URI_V4}/task" 2>/dev/null)" || return 1
++    PM_ECS_TASK="$(printf '%s\n' "${_pm_j}" | awk "${PM_JSON_AWK}" 2>/dev/null)"
++    _pm_j="$(curl -fsS --max-time 3 "${ECS_CONTAINER_METADATA_URI_V4}" 2>/dev/null)" || _pm_j=""
++    PM_ECS_CONT="$(printf '%s\n' "${_pm_j}" | awk "${PM_JSON_AWK}" 2>/dev/null)"
++    [ -n "${PM_ECS_TASK}" ]
++}
++
++pm_jget() {  # flattened-json path -> value
++    printf '%s\n' "$1" | awk -F '\t' -v k="$2" '$1 == k { print $2; exit }'
++}
++
++# ECS タスクメタデータの主な項目を perf_meta.csv へ
++pm_meta_ecs() {
++    pm_ecs_fetch || return 0
++    for _pm_k in Cluster ServiceName TaskARN Family Revision AvailabilityZone LaunchType Limits.CPU Limits.Memory; do
++        _pm_v="$(pm_jget "${PM_ECS_TASK}" "${_pm_k}")"
++        [ -n "${_pm_v}" ] && pm_meta ecs "${_pm_k}" "${_pm_v}"
++    done
++    for _pm_k in Name Limits.CPU Limits.Memory Image; do
++        _pm_v="$(pm_jget "${PM_ECS_CONT}" "${_pm_k}")"
++        [ -n "${_pm_v}" ] && pm_meta ecs "container.${_pm_k}" "${_pm_v}"
++    done
++    return 0
++}
++
++pm_banner_line() {
++    pm_say "$1"
++    [ -n "${PM_LOG_FILE:-}" ] && printf '%s [perf-metrics] [start] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "${PM_LOG_FILE}" 2>/dev/null
++    return 0
++}
++
++# JFR の設定 (JBoss の起動時に渡す -XX:StartFlightRecording / 起動後に渡す jcmd JFR.start の
++# どちらでも使える「キー=値」の並び)。統計イベントの間隔を PERF_JFR_INTERVAL 秒にする。
++pm_jfr_items() {  # separator
++    _pm_p="${PERF_JFR_INTERVAL}s"
++    _pm_ev=""
++    for _pm_e in jdk.CPULoad jdk.ThreadCPULoad jdk.JavaThreadStatistics jdk.ClassLoadingStatistics \
++                 jdk.CompilerStatistics jdk.ExceptionStatistics jdk.ResidentSetSize jdk.DirectBufferStatistics \
++                 jdk.CodeCacheStatistics jdk.ThreadContextSwitchRate jdk.ContainerCPUThrottling \
++                 jdk.NativeMemoryUsage jdk.NativeMemoryUsageTotal; do
++        _pm_ev="${_pm_ev}$1${_pm_e}#period=${_pm_p}"
++    done
++    printf 'name=perf-metrics%ssettings=%s%s%sdisk=true%smaxage=%s%smaxsize=%s%sfilename=%s/perf_%%p_%%t.jfr%sdumponexit=true' \
++        "$1" "${PERF_JFR_SETTINGS}" "${_pm_ev}" "$1" "$1" "${PERF_JFR_MAXAGE}" "$1" "${PERF_JFR_MAXSIZE}" "$1" "${PM_JFR_DIR}" "$1"
++}
++
++pm_jvm_opts_have() {  # pattern -> 0 when JAVA_OPTS / JAVA_TOOL_OPTIONS / JDK_JAVA_OPTIONS already contain it
++    case " ${JAVA_OPTS:-} ${JAVA_TOOL_OPTIONS:-} ${JDK_JAVA_OPTIONS:-} ${PREPEND_JAVA_OPTS:-} " in *"$1"*) return 0 ;; esac
++    return 1
++}
++
++perf_metrics_start() {
++    # エントリポイントの set -e / -u をこの関数の中だけ外す (収集側の都合で起動を止めない)
++    _pm_saved_flags="$-"
++    set +eu
++    PM_NAME=start
++    pm_start_body "$@"
++    _pm_rc=$?
++    case "${_pm_saved_flags}" in *e*) set -e ;; esac
++    case "${_pm_saved_flags}" in *u*) set -u ;; esac
++    return "${_pm_rc}"
++}
++
++pm_start_body() {
++    pm_setup_tz
++    PERF_INTERVAL="$(pm_uint_or "${PERF_INTERVAL}" 10)"
++    PERF_CLI_INTERVAL="$(pm_uint_or "${PERF_CLI_INTERVAL}" "${PERF_INTERVAL}")"
++    PERF_JSTAT_INTERVAL="$(pm_uint_or "${PERF_JSTAT_INTERVAL}" "${PERF_INTERVAL}")"
++    PERF_JCMD_INTERVAL="$(pm_uint_or "${PERF_JCMD_INTERVAL}" 60)"
++    PERF_JFR_INTERVAL="$(pm_uint_or "${PERF_JFR_INTERVAL}" "${PERF_INTERVAL}")"
++    PERF_TOP_INTERVAL="$(pm_uint_or "${PERF_TOP_INTERVAL}" "${PERF_INTERVAL}")"
++    PERF_PS_INTERVAL="$(pm_uint_or "${PERF_PS_INTERVAL}" "${PERF_INTERVAL}")"
++    PERF_PROC_INTERVAL="$(pm_uint_or "${PERF_PROC_INTERVAL}" "${PERF_INTERVAL}")"
++    PERF_CLI_TIMEOUT="$(pm_uint_or "${PERF_CLI_TIMEOUT}" 30)"
++    PERF_CLI_CONNECT_TIMEOUT="$(pm_uint_or "${PERF_CLI_CONNECT_TIMEOUT}" 60)"
++    PERF_WAIT_TIMEOUT="$(pm_uint_or "${PERF_WAIT_TIMEOUT}" 900)"
++    pm_is_uint "${PERF_TOP_THREADS}" || PERF_TOP_THREADS=10
++    case "${PERF_THREADDUMP}" in off|summary|full) ;; *) PERF_THREADDUMP=summary ;; esac
++    case "${PERF_NMT}" in off|summary|detail) ;; *) PERF_NMT=off ;; esac
++
++    if ! pm_resolve_output_dir; then
++        pm_say "WARN: 出力先 '${PM_OUT:-(決められません)}' に書き込めないため、性能試験用メトリクス収集を行いません (JBoss は起動します)" >&2
++        pm_say "WARN: JBOSS_LOG_DIR='${JBOSS_LOG_DIR:-}' EFS_LOG_DIR='${EFS_LOG_DIR:-}' PERF_OUTPUT_DIR='${PERF_OUTPUT_DIR}'" >&2
++        return 1
++    fi
++    if ! pm_resolve_work_dir; then
++        pm_say "WARN: 作業ディレクトリ (/tmp・standalone/tmp・出力先/.work) に書き込めないため、収集を行いません" >&2
++        return 1
++    fi
++    rm -f "${PM_W}"/cli.in "${PM_W}"/cli.out "${PM_W}"/*.pid "${PM_W}"/*.prev "${PM_W}/perf-metrics.state" 2>/dev/null
++    PM_LOG_FILE="${PM_OUT}/collector.log"
++    PM_SELF="${PERF_METRICS_SCRIPT:-${PM_SELF}}"
++
++    # ---- JBoss に足す JVM オプション (JFR・NMT) ----
++    # CMD が standalone.sh (CMD=eap を含む) のときは PREPEND_JAVA_OPTS で起動時から有効にする。
++    # それ以外の CMD では JFR だけ JVM の起動後に jcmd JFR.start で始める (NMT は起動時にしか有効にできない)。
++    PM_JFR_DIR="${PM_OUT}/jfr"
++    PM_JFR_MODE=off
++    PM_JFR_NOTE="無効 (PERF_JFR=${PERF_JFR})"
++    _pm_is_ss=0
++    case "${1:-}" in */standalone.sh|standalone.sh) _pm_is_ss=1 ;; esac
++    PERF_PREPEND_JAVA_OPTS=""
++    if [ "${PERF_JFR}" = "true" ]; then
++        mkdir -p "${PM_JFR_DIR}/repo" "${PM_JFR_DIR}/dump" 2>/dev/null
++        case "${PM_JFR_DIR}${PERF_JFR_SETTINGS}${PERF_JFR_MAXAGE}${PERF_JFR_MAXSIZE}" in
++            *[!A-Za-z0-9/._-]*)
++                PM_JFR_MODE=off
++                PM_JFR_NOTE="無効 (出力先・設定に JFR の引数で使えない文字 (空白・カンマ等) があります)" ;;
++            *)
++                if pm_jvm_opts_have StartFlightRecording; then
++                    PM_JFR_MODE=user
++                    PM_JFR_NOTE="JAVA_OPTS 等に -XX:StartFlightRecording が既にあるため追加しません"
++                elif [ "${_pm_is_ss}" = 1 ]; then
++                    PM_JFR_MODE=startup
++                    PERF_PREPEND_JAVA_OPTS="-XX:StartFlightRecording:$(pm_jfr_items ,) -XX:FlightRecorderOptions:repository=${PM_JFR_DIR}/repo,preserve-repository=true"
++                    PM_JFR_NOTE="JBoss の起動時から記録 (統計イベント ${PERF_JFR_INTERVAL} 秒間隔、settings=${PERF_JFR_SETTINGS}、最大 ${PERF_JFR_MAXAGE} / ${PERF_JFR_MAXSIZE})"
++                else
++                    PM_JFR_MODE=jcmd
++                    PM_JFR_NOTE="JVM の起動後に jcmd JFR.start で記録を始めます (統計イベント ${PERF_JFR_INTERVAL} 秒間隔)"
++                fi ;;
++        esac
++    fi
++    PM_NMT_NOTE="無効"
++    if [ "${PERF_NMT}" != "off" ]; then
++        if pm_jvm_opts_have NativeMemoryTracking; then
++            PM_NMT_NOTE="JAVA_OPTS 等の -XX:NativeMemoryTracking を使用"
++        elif [ "${_pm_is_ss}" = 1 ]; then
++            PERF_PREPEND_JAVA_OPTS="${PERF_PREPEND_JAVA_OPTS}${PERF_PREPEND_JAVA_OPTS:+ }-XX:NativeMemoryTracking=${PERF_NMT}"
++            PM_NMT_NOTE="-XX:NativeMemoryTracking=${PERF_NMT}"
++        else
++            PM_NMT_NOTE="CMD が standalone.sh ではないため有効にできません"
++        fi
++    fi
++    if [ -n "${PERF_PREPEND_JAVA_OPTS}" ] && [ "${PRESERVE_JAVA_OPTS:-}" = "true" ]; then
++        pm_say "WARN: PRESERVE_JAVA_OPTS=true のため standalone.sh は PREPEND_JAVA_OPTS を使いません。JFR は JVM の起動後に jcmd で始めます (NMT は無効)" >&2
++        [ "${PM_JFR_MODE}" = startup ] && PM_JFR_MODE=jcmd
++        PERF_PREPEND_JAVA_OPTS=""
++    fi
++
++    # 収集プロセスへ渡す値
++    export PM_OUT PM_W PM_LOG_FILE PM_SELF PM_JFR_DIR PM_JFR_MODE TZ \
++        PERF_INTERVAL PERF_CLI_INTERVAL PERF_JSTAT_INTERVAL PERF_JCMD_INTERVAL PERF_JFR_INTERVAL PERF_TOP_INTERVAL \
++        PERF_PS_INTERVAL PERF_PROC_INTERVAL PERF_COLLECTORS PERF_TZ PERF_CLI_ENABLE_DS_STATS PERF_CLI_CONTROLLER \
++        PERF_CLI_USER PERF_CLI_PASSWORD PERF_CLI_TIMEOUT PERF_CLI_CONNECT_TIMEOUT PERF_CLI_HEAP PERF_JFR \
++        PERF_JFR_SETTINGS PERF_JFR_MAXAGE PERF_JFR_MAXSIZE PERF_NMT PERF_THREADDUMP PERF_TOP_THREADS PERF_TOP_RAW \
++        PERF_JVM_CONTAINERS PERF_WAIT_TIMEOUT PERF_TOOL_JAVA_OPTS PERF_ENABLE_STATISTICS
++
++    # 収集条件 (レポートの「収集情報」に出る)
++    pm_now
++    pm_meta perf version "${PERF_METRICS_VERSION}"
++    pm_meta perf start_time "${PM_TS}"
++    pm_meta perf start_epoch "${PM_EPOCH}"
++    pm_meta perf utc_offset "$(date +%z)"
++    pm_meta perf output_dir "${PM_OUT}"
++    pm_meta perf work_dir "${PM_W}"
++    pm_meta perf collectors "${PERF_COLLECTORS}"
++    pm_meta perf cli_interval "${PERF_CLI_INTERVAL}"
++    pm_meta perf jstat_interval "${PERF_JSTAT_INTERVAL}"
++    pm_meta perf jcmd_interval "${PERF_JCMD_INTERVAL}"
++    pm_meta perf jfr_interval "${PERF_JFR_INTERVAL}"
++    pm_meta perf top_interval "${PERF_TOP_INTERVAL}"
++    pm_meta perf ps_interval "${PERF_PS_INTERVAL}"
++    pm_meta perf proc_interval "${PERF_PROC_INTERVAL}"
++    pm_meta perf jfr_mode "${PM_JFR_MODE}"
++    pm_meta perf jfr_note "${PM_JFR_NOTE}"
++    pm_meta perf nmt "${PM_NMT_NOTE}"
++    pm_meta perf threaddump "${PERF_THREADDUMP}"
++    pm_meta perf top_threads "${PERF_TOP_THREADS}"
++    pm_meta perf statistics_opts "${PERF_SERVER_OPTS}"
++    pm_meta perf prepend_java_opts "${PERF_PREPEND_JAVA_OPTS}"
++    pm_meta container hostname "$(cat /proc/sys/kernel/hostname 2>/dev/null)"
++    pm_meta container service_name "${Service_Name:-}"
++    pm_meta container component_name "${Component_name:-}"
++    pm_meta container component_role "${COMPONENT_ROLE:-}"
++    pm_meta container log_id "$(basename "$(dirname "${PM_OUT}")")"
++    pm_meta container jboss_home "${JBOSS_HOME:-}"
++    pm_meta container cpus_online "$(getconf _NPROCESSORS_ONLN 2>/dev/null)"
++    pm_meta container mem_total_kb "$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null)"
++    pm_meta container os "$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release 2>/dev/null)"
++    pm_meta container command "$(printf '%s ' "$@" | sed "${PM_MASK_SED}")"
++    pm_meta_ecs
++
++    {
++        echo "PM_OUT='${PM_OUT}'"
++        echo "PM_W='${PM_W}'"
++        echo "PM_LOG_FILE='${PM_LOG_FILE}'"
++        echo "PM_JFR_DIR='${PM_JFR_DIR}'"
++        echo "PM_START_TS='${PM_TS}'"
++    } > "${PM_W}/perf-metrics.state" 2>/dev/null
++
++    # JFR の CSV 変換プログラムを出力先にも置く (PC に持ち帰った .jfr を JDK 17 以降で変換できる)
++    if [ "${PERF_JFR}" = "true" ] && [ -d "${PM_JFR_DIR}" ]; then
++        printf '%s\n' "${PM_JFR_JAVA}" > "${PM_JFR_DIR}/PerfJfrCsv.java" 2>/dev/null
++    fi
++
++    # 有効であることを起動ログで分かるようにする
++    _pm_off() { pm_has_collector "$1" || printf ' (無効)'; }
++    _pm_ps_src="top / ps"
++    command -v top >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 || _pm_ps_src="top / ps が無いため /proc から同等の値を算出"
++    _pm_jc="GC.heap_info, Compiler.codecache"
++    [ "${PERF_THREADDUMP}" != off ] && _pm_jc="${_pm_jc}, Thread.print"
++    [ "${PERF_NMT}" != off ] && _pm_jc="${_pm_jc}, VM.native_memory"
++    pm_banner_line "======================================================================"
++    pm_banner_line " 性能試験用メトリクス収集: 有効  (perf-metrics.sh ${PERF_METRICS_VERSION} / PERF_METRICS_ENABLED=true)"
++    pm_banner_line " 出力先 : ${PM_OUT}"
++    pm_banner_line "          (${PM_OUT_NOTE}。最後に起動したタスクは mid/current/perf から辿れます)"
++    pm_banner_line " ① jboss-cli : ${PERF_CLI_INTERVAL} 秒間隔$(_pm_off cli)  DB 接続プール・HTTP・セッション・スレッドプール・トランザクション・JVM"
++    pm_banner_line " ② jstat     : ${PERF_JSTAT_INTERVAL} 秒間隔$(_pm_off jstat)  ヒープ・GC・GC 原因・セーフポイント   jcmd: ${PERF_JCMD_INTERVAL} 秒間隔$(_pm_off jcmd)  (${_pm_jc})"
++    pm_banner_line "    JFR       : ${PM_JFR_NOTE}"
++    pm_banner_line " ③ top / ps  : ${PERF_TOP_INTERVAL} / ${PERF_PS_INTERVAL} 秒間隔$(_pm_off top)$(_pm_off ps)  (${_pm_ps_src})  JBoss のスレッド別 CPU・FD・TCP: ${PERF_PROC_INTERVAL} 秒間隔$(_pm_off proc)"
++    pm_banner_line " ④ CPU 数    : JVM 起動後に ActiveProcessorCount の要否を判定 (cpu_env.csv)。CPU の待ち・steal: ${PERF_PROC_INTERVAL} 秒間隔 (cpu_sched.csv)"
++    [ -n "${PERF_SERVER_OPTS}" ] && pm_banner_line " 統計の有効化: ${PERF_SERVER_OPTS} を standalone.sh へ追加"
++    [ -n "${PERF_PREPEND_JAVA_OPTS}" ] && pm_banner_line " JVM オプション: PREPEND_JAVA_OPTS へ追加 (JAVA_OPTS は変更しません): ${PERF_PREPEND_JAVA_OPTS}"
++    pm_banner_line " 作業ディレクトリ: ${PM_W}   状態確認: perf-metrics.sh status (ECS Exec で実行)"
++    pm_banner_line " ※ Container Insights (拡張) で見られる CPU・メモリ・ネットワーク・ストレージの使用量は取得しません"
++    pm_banner_line " ※ 性能試験用のイメージです。本番は PERF_METRICS_ENABLED=false でビルドしてください"
++    pm_banner_line "======================================================================"
++
++    # 前提の確認 (足りないものは警告し、その収集だけ止まる / 代替する)
++    if { pm_has_collector jstat || pm_has_collector jcmd; } && ! pm_is_writable /tmp; then
++        pm_say "WARN: /tmp に書き込めないため jstat / jcmd は JVM に接続できません (hsperfdata・アタッチ用ソケットを /tmp に作るため)。" >&2
++        pm_say "WARN: タスク定義で /tmp に書き込み可能ボリュームを当ててください (① ③ ④ は取得できます)" >&2
++    fi
++    if pm_has_collector cli && [ ! -f "${JBOSS_HOME:-/opt/jboss-eap}/bin/jboss-cli.sh" ]; then
++        pm_say "WARN: ${JBOSS_HOME:-/opt/jboss-eap}/bin/jboss-cli.sh がありません。① の取得は行いません" >&2
++    fi
++
++    # 収集プロセスを起動 (JBoss の起動とは並行して動き、JVM の出現を待ってから取得する)
++    for _pm_c in ${PERF_COLLECTORS}; do
++        case "${_pm_c}" in
++            cli|jstat|jcmd|top|ps|proc) ;;
++            none) continue ;;
++            *) pm_say "WARN: PERF_COLLECTORS の不明な値を無視します: ${_pm_c}" >&2; continue ;;
++        esac
++        /bin/sh "${PM_SELF}" run "${_pm_c}" < /dev/null > /dev/null &
++        echo "$!" > "${PM_W}/${_pm_c}.pid" 2>/dev/null
++        pm_log INFO "収集プロセスを起動しました: ${_pm_c} (pid=$!)"
++    done
++    return 0
++}
++
++# =============================================================================
++# ① jboss-cli
++# =============================================================================
++# 取得するのは管理モデルの読み取りだけ。jboss-cli は常駐セッション (FIFO) で 1 つだけ
++# 起動し、間隔ごとに JVM を起動し直すことはしない (起動のたびに CPU を 1 秒以上使うため)。
++# 各操作は try / catch で囲み、無いサブシステム (ejb3 など) があっても他は取得する。
++
++pm_cli_q() {  # id operation
++    printf 'echo PERF_B %s\ntry\n%s\ncatch\necho PERF_F %s\nend-try\n' "$1" "$2" "$1"
++}
++
++pm_cli_quote() {
++    case "$1" in
++        *[!A-Za-z0-9_.-]*) printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')" ;;
++        *) printf '%s' "$1" ;;
++    esac
++}
++
++pm_cli_sample_block() {
++    _pm_pm="/core-service=platform-mbean"
++    for _pm_t in ds xa; do
++        if [ "${_pm_t}" = ds ]; then _pm_r=data-source; else _pm_r=xa-data-source; fi
++        pm_cli_q "dsp.${_pm_t}" "/subsystem=datasources/${_pm_r}=*/statistics=pool:read-resource(include-runtime=true)"
++        # 使用率の計算に使う設定。パスワード等を読まないよう属性ごとに読む
++        for _pm_a in jndi-name min-pool-size max-pool-size blocking-timeout-wait-millis; do
++            pm_cli_q "dsa.${_pm_t}.${_pm_a}" "/subsystem=datasources/${_pm_r}=*:read-attribute(name=${_pm_a},resolve-expressions=true)"
++        done
++    done
++    pm_cli_q web.stat "/subsystem=undertow:read-attribute(name=statistics-enabled,resolve-expressions=true)"
++    for _pm_t in http https ajp; do
++        pm_cli_q "web.${_pm_t}" "/subsystem=undertow/server=*/${_pm_t}-listener=*:read-resource(include-runtime=true,resolve-expressions=true)"
++    done
++    pm_cli_q ses.dep "/deployment=*/subsystem=undertow:read-resource(include-runtime=true)"
++    pm_cli_q ses.sub "/deployment=*/subdeployment=*/subsystem=undertow:read-resource(include-runtime=true)"
++    pm_cli_q iow "/subsystem=io/worker=*:read-resource(include-runtime=true,resolve-expressions=true)"
++    pm_cli_q ios "/subsystem=io/worker=*/server=*:read-resource(include-runtime=true)"
++    pm_cli_q tpe.ejb "/subsystem=ejb3/thread-pool=*:read-resource(include-runtime=true,resolve-expressions=true)"
++    pm_cli_q tpe.ee "/subsystem=ee/managed-executor-service=*:read-resource(include-runtime=true,resolve-expressions=true)"
++    pm_cli_q tpe.ees "/subsystem=ee/managed-scheduled-executor-service=*:read-resource(include-runtime=true,resolve-expressions=true)"
++    pm_cli_q tx "/subsystem=transactions:read-resource(include-runtime=true,resolve-expressions=true)"
++    pm_cli_q srv.state ":read-attribute(name=server-state)"
++    pm_cli_q srv.suspend ":read-attribute(name=suspend-state)"
++    pm_cli_q rc "/subsystem=request-controller:read-attribute(name=active-requests)"
++    pm_cli_q mem "${_pm_pm}/type=memory:read-resource(include-runtime=true)"
++    pm_cli_q cls "${_pm_pm}/type=class-loading:read-resource(include-runtime=true)"
++    pm_cli_q buf "${_pm_pm}/type=buffer-pool/name=*:read-resource(include-runtime=true)"
++    pm_cli_q os "${_pm_pm}/type=operating-system:read-resource(include-runtime=true)"
++    pm_cli_q thr.peak "${_pm_pm}/type=threading:read-attribute(name=peak-thread-count)"
++    pm_cli_q thr.daemon "${_pm_pm}/type=threading:read-attribute(name=daemon-thread-count)"
++    pm_cli_q thr.started "${_pm_pm}/type=threading:read-attribute(name=total-started-thread-count)"
++    # ライブスレッド数は最後に読む (直後に /proc の OS スレッド数を読むため)
++    pm_cli_q thr.count "${_pm_pm}/type=threading:read-attribute(name=thread-count)"
++}
++
++pm_cli_meta_block() {
++    _pm_pm="/core-service=platform-mbean"
++    pm_cli_q m.product-name ":read-attribute(name=product-name)"
++    pm_cli_q m.product-version ":read-attribute(name=product-version)"
++    pm_cli_q m.release-version ":read-attribute(name=release-version)"
++    pm_cli_q m.server-name ":read-attribute(name=name)"
++    pm_cli_q m.launch-type ":read-attribute(name=launch-type)"
++    pm_cli_q m.running-mode ":read-attribute(name=running-mode)"
++    pm_cli_q m.config-file "/core-service=server-environment:read-attribute(name=config-file)"
++    pm_cli_q m.node-name "/core-service=server-environment:read-attribute(name=node-name)"
++    pm_cli_q m.vm-name "${_pm_pm}/type=runtime:read-attribute(name=vm-name)"
++    pm_cli_q m.vm-vendor "${_pm_pm}/type=runtime:read-attribute(name=vm-vendor)"
++    pm_cli_q m.vm-version "${_pm_pm}/type=runtime:read-attribute(name=vm-version)"
++    pm_cli_q m.jvm-start-time "${_pm_pm}/type=runtime:read-attribute(name=start-time)"
++    pm_cli_q m.available-processors "${_pm_pm}/type=operating-system:read-attribute(name=available-processors)"
++}
++
++# 解析用 awk: DMR 形式の応答を字句解析し、ワイルドカードの各要素ごとに CSV 行へ。
++# 応答は「PERF_B <id>」で区切られ、ワイルドカードの結果は address → result の順に並ぶ。
++# 未定義 (undefined) の値は空欄になる (ワイルドカードの read-attribute では要素ごと省かれる)。
++PM_CLI_AWK='
++function trim(s) { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
++function csvq(s) { if (s ~ /[",\r\n]/) { gsub(/"/, "\"\"", s); return "\"" s "\"" } return s }
++function norm(v) {
++  v = trim(v)
++  if (v == "undefined") return ""
++  sub(/^expression /, "", v); sub(/^big (decimal|integer) /, "", v)
++  if (v ~ /^-?[0-9]+L$/) v = substr(v, 1, length(v) - 1)
++  return v
++}
++function header_all() {
++  HD["cli_datasource.csv"] = "timestamp,epoch,ds_type,ds_name,jndi_name,statistics_enabled,min_pool_size,max_pool_size,blocking_timeout_ms," POOLC "," XAC
++  HD["cli_undertow.csv"] = "timestamp,epoch,server,listener_type,listener,statistics_enabled,record_request_start_time," WEBC
++  HD["cli_session.csv"] = "timestamp,epoch,deployment," SESC
++  HD["cli_io_worker.csv"] = "timestamp,epoch,worker," IOWC ",connection-count"
++  HD["cli_threadpool.csv"] = "timestamp,epoch,pool_type,pool,active,current,largest,queue,completed,tasks,rejected,hung,max"
++  HD["cli_transactions.csv"] = "timestamp,epoch,statistics_enabled," TXC
++  HD["cli_jvm.csv"] = "timestamp,epoch,cli_ms,cli_ok,server_state,suspend_state,active_requests,pid,live_threads,peak_threads,daemon_threads,started_threads,os_threads,loaded_classes,total_loaded_classes,unloaded_classes,heap_used,heap_committed,heap_max,nonheap_used,nonheap_committed,direct_count,direct_used,direct_capacity,mapped_count,mapped_used,available_processors,system_load_average"
++}
++BEGIN {
++  POOLC = "ActiveCount,AvailableCount,InUseCount,IdleCount,MaxUsedCount,WaitCount,MaxWaitCount,BlockingFailureCount,TimedOut,CreatedCount,DestroyedCount,AverageGetTime,MaxGetTime,TotalGetTime,AverageBlockingTime,MaxWaitTime,TotalBlockingTime,AverageUsageTime,MaxUsageTime,TotalUsageTime,AverageCreationTime,MaxCreationTime,TotalCreationTime,AveragePoolTime,MaxPoolTime,TotalPoolTime"
++  XAC = "XACommitCount,XACommitAverageTime,XACommitMaxTime,XARollbackCount,XARollbackAverageTime,XAPrepareCount,XAPrepareAverageTime,XAPrepareMaxTime,XAStartCount,XAStartAverageTime,XAStartMaxTime,XAEndCount,XAEndAverageTime,XAEndMaxTime,XARecoverCount,XAForgetCount"
++  WEBC = "request-count,error-count,processing-time,max-processing-time"
++  SESC = "context-root,active-sessions,sessions-created,expired-sessions,rejected-sessions,max-active-sessions,highest-session-count,session-avg-alive-time,session-max-alive-time"
++  IOWC = "io-thread-count,busy-task-thread-count,core-pool-size,max-pool-size,queue-size,task-core-threads,task-max-threads,io-threads"
++  TXC = "number-of-transactions,number-of-committed-transactions,number-of-aborted-transactions,number-of-inflight-transactions,number-of-timed-out-transactions,number-of-heuristics,number-of-application-rollbacks,number-of-resource-rollbacks,number-of-system-rollbacks,number-of-nested-transactions,average-commit-time"
++  header_all()
++  if (mode == "header") {
++    for (f in HD) {
++      p = dir "/" f; has = 0
++      if ((getline line < p) > 0) has = 1
++      close(p)
++      if (!has) { print HD[f] >> p; close(p) }
++    }
++    exit
++  }
++  D = 0; BLK = ""
++}
++# ---- 字句解析 ----
++function lex(line,    i, n, c, s, j, q) {
++  NT = 0; n = length(line); i = 1
++  while (i <= n) {
++    c = substr(line, i, 1)
++    if (c == " " || c == "\t" || c == "\r") { i++; continue }
++    if (c == "\"") {
++      s = ""; j = i + 1
++      while (j <= n) {
++        q = index(substr(line, j), "\"")
++        if (q == 0) { s = s substr(line, j); j = n + 1; break }
++        s = s substr(line, j, q - 1); j = j + q - 1
++        if (substr(s, length(s), 1) == "\\" && substr(s, length(s) - 1, 1) != "\\") { s = substr(s, 1, length(s) - 1) "\""; j++; continue }
++        break
++      }
++      gsub(/\\\\/, "\\", s)
++      NT++; TT[NT] = "S"; TV[NT] = s; i = j + 1; continue
++    }
++    if (c == "=" && substr(line, i + 1, 1) == ">") { NT++; TT[NT] = "A"; TV[NT] = ""; i += 2; continue }
++    if (index("{}[](),", c) > 0) { NT++; TT[NT] = c; TV[NT] = c; i++; continue }
++    j = i
++    while (j <= n && index(" \t\r{}[](),\"", substr(line, j, 1)) == 0) j++
++    NT++; TT[NT] = "W"; TV[NT] = substr(line, i, j - i); i = j
++  }
++}
++# ---- 構文の追跡 (スタック) ----
++function path(d,    p, k) { p = ""; for (k = 2; k <= d; k++) { if (p != "") p = p "/"; p = p FK[k] } return p }
++function addent(tab, ent) { if (!((tab, ent) in SEEN)) { SEEN[tab, ent] = 1; ORD[tab, ++NO[tab]] = ent } }
++function emit(    k, ty, nm, ent, s, t2, a, lt) {
++  if (BLK ~ /^dsp\.(ds|xa)$/) {
++    t2 = substr(BLK, 5); ty = (t2 == "xa") ? "xa-data-source" : "data-source"
++    nm = A[ty]; if (nm == "") return
++    ent = t2 SUBSEP nm; addent("ds", ent)
++    for (k in R) V["ds", ent, "p", k] = R[k]
++    return
++  }
++  if (BLK ~ /^dsa\.(ds|xa)\./) {
++    s = substr(BLK, 5); t2 = substr(s, 1, 2); a = substr(s, 4)
++    ty = (t2 == "xa") ? "xa-data-source" : "data-source"
++    nm = A[ty]; if (nm == "") return
++    ent = t2 SUBSEP nm; addent("ds", ent)
++    if ("_value" in R) V["ds", ent, "a", a] = R["_value"]
++    return
++  }
++  if (BLK ~ /^web\.(http|https|ajp)$/) {
++    lt = substr(BLK, 5); nm = A[lt "-listener"]; if (nm == "") return
++    ent = A["server"] SUBSEP lt SUBSEP nm; addent("web", ent)
++    for (k in R) V["web", ent, k] = R[k]
++    return
++  }
++  if (BLK == "ses.dep" || BLK == "ses.sub") {
++    nm = A["deployment"]; if (nm == "") return
++    if (BLK == "ses.sub") nm = nm "/" A["subdeployment"]
++    addent("ses", nm); for (k in R) V["ses", nm, k] = R[k]
++    return
++  }
++  if (BLK == "iow") { nm = A["worker"]; if (nm == "") return; addent("iow", nm); for (k in R) V["iow", nm, k] = R[k]; return }
++  if (BLK == "ios") { nm = A["worker"]; if (nm == "") return; IOS[nm] += R["connection-count"] + 0; return }
++  if (BLK ~ /^tpe\./) {
++    if (BLK == "tpe.ejb") { ty = "ejb3"; nm = A["thread-pool"] }
++    else if (BLK == "tpe.ee") { ty = "ee-executor"; nm = A["managed-executor-service"] }
++    else { ty = "ee-scheduled"; nm = A["managed-scheduled-executor-service"] }
++    if (nm == "") return
++    ent = ty SUBSEP nm; addent("tpe", ent); for (k in R) V["tpe", ent, k] = R[k]
++    return
++  }
++  if (BLK == "buf") { nm = A["name"]; if (nm == "") return; for (k in R) V["buf", nm, k] = R[k]; return }
++  if (BLK ~ /^m\./) { if ("_value" in R) print "jboss," substr(BLK, 3) "," csvq(R["_value"]) >> metaf; return }
++  for (k in R) J[BLK, k] = R[k]
++}
++function push(t, key) {
++  D++; FT[D] = t; FK[D] = key; ST[D] = 0; VB = ""
++  if (t == "{" && D == 3 && FK[2] == "result" && FT[2] == "[" && key == "#") { WILD = 1; split("", R); split("", A); EOUT = "" }
++  if (D == 1) { WILD = 0; ROUT = ""; split("", R); split("", A) }
++}
++function pop(    t) {
++  t = FT[D]
++  if (t == "{" && D == 3 && FK[2] == "result" && FT[2] == "[" && FK[3] == "#") { if (EOUT == "success" || EOUT == "") emit() }
++  if (D == 1 && !WILD && ROUT == "success") emit()
++  D--
++  if (D > 0 && (FT[D] == "{" || FT[D] == "(")) ST[D] = 3
++}
++function scalar(key, v,    full, p) {
++  v = norm(v)
++  if (FT[D] == "(") { p = path(D - 1); if (p ~ /\/address$/ || p == "address") A[key] = v; return }
++  p = path(D); full = (p == "" ? key : p "/" key)
++  if (full == "outcome") { ROUT = v; return }
++  if (full == "result") { R["_value"] = v; return }
++  if (full == "result/#/outcome") { EOUT = v; return }
++  if (full == "result/#/result") { R["_value"] = v; return }
++  if (substr(full, 1, 16) == "result/#/result/") { full = substr(full, 17); gsub(/\//, ".", full); R[full] = v; return }
++  if (substr(full, 1, 7) == "result/" && substr(full, 1, 9) != "result/#/") { full = substr(full, 8); gsub(/\//, ".", full); R[full] = v; return }
++}
++function tok(t, v,    f) {
++  if (D == 0) { if (t == "{") push("{", ""); return }
++  f = FT[D]
++  if (f == "{" || f == "(") {
++    if (ST[D] == 0) {
++      if (t == "S" || t == "W") { CK[D] = v; ST[D] = 1; return }
++      if (t == "}" || t == ")") pop()
++      return
++    }
++    if (ST[D] == 1) { if (t == "A") { ST[D] = 2; VB = ""; VN = 0 } return }
++    if (ST[D] == 2) {
++      if (t == "{" || t == "[" || t == "(") { if (VN == 0) { ST[D] = 3; push(t, CK[D]) } return }
++      if (t == "S" || t == "W") { VB = (VN == 0 ? v : VB " " v); VN++; return }
++      if (t == ",") { scalar(CK[D], VB); ST[D] = 0; return }
++      if (t == "}" || t == ")") { scalar(CK[D], VB); pop(); return }
++      return
++    }
++    if (ST[D] == 3) {
++      if (t == ",") { ST[D] = 0; return }
++      if (t == "}" || t == ")") pop()
++      return
++    }
++    return
++  }
++  if (f == "[") {
++    if (t == "]") { pop(); return }
++    if (t == "{" || t == "[" || t == "(") { push(t, "#"); return }
++    return
++  }
++}
++# ---- 1 レコード (応答 1 つ、またはワイルドカードの要素 1 つ) を表へ ----
++function g(tab, ent, k) { return ((tab, ent, k) in V) ? V[tab, ent, k] : "" }
++function jv(b, k) { return ((b, k) in J) ? J[b, k] : "" }
++function cols(tab, ent, list,    n, a, i, s) {
++  n = split(list, a, ","); s = ""
++  for (i = 1; i <= n; i++) s = s "," csvq(g(tab, ent, a[i]))
++  return s
++}
++/^PERF_B / { BLK = $2; D = 0; next }
++/^PERF_F / { FAIL[$2] = 1; NFAIL++; FAILS = FAILS " " $2; next }
++/^PERF_[SE] / { BLK = ""; D = 0; next }
++BLK == "" { next }
++{
++  lex($0)
++  for (ti = 1; ti <= NT; ti++) tok(TT[ti], TV[ti])
++}
++END {
++  if (mode == "header") exit
++  pre = csvq(ts) "," epoch
++  if (mode == "meta") exit
++  if (ok == 1) {
++    # ① データソース (プール統計の無い要素は書かない)
++    for (i = 1; i <= NO["ds"]; i++) {
++      ent = ORD["ds", i]; split(ent, e, SUBSEP)
++      if (g("ds", ent SUBSEP "p", "InUseCount") == "") continue
++      st = g("ds", ent SUBSEP "p", "statistics-enabled")
++      print pre "," e[1] "," csvq(e[2]) "," csvq(g("ds", ent SUBSEP "a", "jndi-name")) "," st \
++        "," g("ds", ent SUBSEP "a", "min-pool-size") "," g("ds", ent SUBSEP "a", "max-pool-size") "," g("ds", ent SUBSEP "a", "blocking-timeout-wait-millis") \
++        cols("ds", ent SUBSEP "p", POOLC) cols("ds", ent SUBSEP "p", XAC) >> (dir "/cli_datasource.csv")
++      if (enlist != "" && st == "false") print (e[1] == "xa" ? "xa-data-source" : "data-source") "\t" e[2] > enlist
++    }
++    # HTTP リスナー (転送量 bytes-* は Container Insights のネットワーク転送量と重なるため書かない)
++    for (i = 1; i <= NO["web"]; i++) {
++      ent = ORD["web", i]; split(ent, e, SUBSEP)
++      print pre "," csvq(e[1]) "," e[2] "," csvq(e[3]) "," jv("web.stat", "_value") "," g("web", ent, "record-request-start-time") cols("web", ent, WEBC) >> (dir "/cli_undertow.csv")
++    }
++    for (i = 1; i <= NO["ses"]; i++) { ent = ORD["ses", i]; print pre "," csvq(ent) cols("ses", ent, SESC) >> (dir "/cli_session.csv") }
++    for (i = 1; i <= NO["iow"]; i++) {
++      ent = ORD["iow", i]
++      print pre "," csvq(ent) cols("iow", ent, IOWC) "," ((ent in IOS) ? IOS[ent] : "") >> (dir "/cli_io_worker.csv")
++    }
++    for (i = 1; i <= NO["tpe"]; i++) {
++      ent = ORD["tpe", i]; split(ent, e, SUBSEP)
++      if (e[1] == "ejb3") {
++        r = g("tpe", ent, "active-count") "," g("tpe", ent, "current-thread-count") "," g("tpe", ent, "largest-thread-count") "," g("tpe", ent, "queue-size") \
++          "," g("tpe", ent, "completed-task-count") "," g("tpe", ent, "task-count") "," g("tpe", ent, "rejected-count") ",," g("tpe", ent, "max-threads")
++      } else {
++        r = g("tpe", ent, "active-thread-count") "," g("tpe", ent, "thread-count") "," g("tpe", ent, "max-thread-count") "," g("tpe", ent, "current-queue-size") \
++          "," g("tpe", ent, "completed-task-count") "," g("tpe", ent, "task-count") ",," g("tpe", ent, "hung-thread-count") "," g("tpe", ent, "max-threads")
++      }
++      print pre "," e[1] "," csvq(e[2]) "," r >> (dir "/cli_threadpool.csv")
++    }
++    if (("tx", "number-of-transactions") in J) {
++      n = split(TXC, a, ","); s = ""
++      for (k = 1; k <= n; k++) s = s "," jv("tx", a[k])
++      print pre "," jv("tx", "statistics-enabled") s >> (dir "/cli_transactions.csv")
++    }
++  }
++  # JVM (jboss-cli が応答しなかった回も、OS スレッド数だけは書く)
++  print pre "," cli_ms "," ok "," jv("srv.state", "_value") "," jv("srv.suspend", "_value") "," jv("rc", "_value") "," pid \
++    "," jv("thr.count", "_value") "," jv("thr.peak", "_value") "," jv("thr.daemon", "_value") "," jv("thr.started", "_value") "," osthr \
++    "," jv("cls", "loaded-class-count") "," jv("cls", "total-loaded-class-count") "," jv("cls", "unloaded-class-count") \
++    "," jv("mem", "heap-memory-usage.used") "," jv("mem", "heap-memory-usage.committed") "," jv("mem", "heap-memory-usage.max") \
++    "," jv("mem", "non-heap-memory-usage.used") "," jv("mem", "non-heap-memory-usage.committed") \
++    "," g("buf", "direct", "count") "," g("buf", "direct", "memory-used") "," g("buf", "direct", "total-capacity") \
++    "," g("buf", "mapped", "count") "," g("buf", "mapped", "memory-used") \
++    "," jv("os", "available-processors") "," jv("os", "system-load-average") >> (dir "/cli_jvm.csv")
++  if (failf != "") { print NFAIL + 0 "\t" FAILS > failf }
++}
++'
++
++# jboss-cli.sh を、サーバーと同じ java・小さなヒープで起動する (サブシェルから exec)
++pm_cli_exec() {  # cli-file
++    unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS
++    JAVA_OPTS="${PM_CLI_JAVA_OPTS}"
++    export JAVA_OPTS JBOSS_HOME
++    [ -n "${PM_CLI_JAVA:-}" ] && { JAVA="${PM_CLI_JAVA}"; export JAVA; }
++    set -- --connect "--controller=${PM_CLI_CTRL}" "--timeout=15000" "--command-timeout=${PERF_CLI_TIMEOUT}" "--file=$1"
++    [ -n "${PERF_CLI_USER}" ] && set -- "$@" "--user=${PERF_CLI_USER}"
++    [ -n "${PERF_CLI_PASSWORD}" ] && set -- "$@" "--password=${PERF_CLI_PASSWORD}"
++    exec "${PM_CLI}" "$@"
++}
++
++# サーバーの起動引数から JBOSS_HOME・管理インタフェースのアドレス / ポートを読む
++pm_cli_resolve() {
++    JBOSS_HOME="${JBOSS_HOME:-}"
++    _pm_addr=""; _pm_port=""; _pm_off=0; _pm_prev=""
++    if [ -r "/proc/${PM_JPID}/cmdline" ]; then
++        _pm_oifs="${IFS}"; IFS='
++'
++        for _pm_a in $(tr '\0' '\n' 2>/dev/null < "/proc/${PM_JPID}/cmdline"); do
++            case "${_pm_a}" in
++                -Djboss.home.dir=*) [ -z "${JBOSS_HOME}" ] && JBOSS_HOME="${_pm_a#*=}" ;;
++                -Djboss.bind.address.management=*|-bmanagement=*) _pm_addr="${_pm_a#*=}" ;;
++                -Djboss.management.http.port=*) _pm_port="${_pm_a#*=}" ;;
++                -Djboss.socket.binding.port-offset=*) _pm_off="${_pm_a#*=}" ;;
++            esac
++            [ "${_pm_prev}" = "-bmanagement" ] && _pm_addr="${_pm_a}"
++            _pm_prev="${_pm_a}"
++        done
++        IFS="${_pm_oifs}"
++    fi
++    JBOSS_HOME="${JBOSS_HOME:-/opt/jboss-eap}"
++    PM_CLI="${JBOSS_HOME}/bin/jboss-cli.sh"
++    [ -f "${PM_CLI}" ] || return 1
++    _pm_port="$(pm_uint_or "${_pm_port}" 9990)"
++    pm_is_uint "${_pm_off}" || _pm_off=0
++    case "${_pm_addr}" in ""|0.0.0.0|::|"[::]"|localhost) _pm_addr=127.0.0.1 ;; esac
++    PM_CLI_CTRL="${PERF_CLI_CONTROLLER:-remote+http://${_pm_addr}:$(( _pm_port + _pm_off ))}"
++    PM_CLI_JAVA="$(pm_java_of_jboss)" || PM_CLI_JAVA=""
++    # 先頭の -Dperf.metrics.collector は目印 (ps / top で手動実行の jboss-cli と区別するため)
++    PM_CLI_JAVA_OPTS="-Dperf.metrics.collector=jboss-cli -Xms16m -Xmx${PERF_CLI_HEAP} -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -XX:-UsePerfData -Xss512k -XX:ReservedCodeCacheSize=32m -Djava.awt.headless=true"
++    return 0
++}
++
++pm_cli_alive() { [ -n "${PM_CLI_PID:-}" ] && kill -0 "${PM_CLI_PID}" 2>/dev/null; }
++
++pm_cli_stop() {
++    if [ "${PM_CLI_FD:-0}" = 1 ]; then
++        printf 'quit\n' >&7 2>/dev/null
++        exec 7>&-
++        PM_CLI_FD=0
++    fi
++    if pm_cli_alive; then
++        sleep 1
++        pm_cli_alive && pm_kill_tree "${PM_CLI_PID}"
++    fi
++    [ -n "${PM_CLI_PID:-}" ] && wait "${PM_CLI_PID}" 2>/dev/null
++    PM_CLI_PID=""
++    rm -f "${PM_W}/cli.in" 2>/dev/null
++    return 0
++}
++
++# 目印の行が出るまで待つ。0=出た 1=CLI が終了した 2=タイムアウト
++pm_cli_wait() {  # marker timeout
++    _pm_dl=$(( $(date +%s) + $2 ))
++    while :; do
++        grep -qx "$1" "${PM_W}/cli.out" 2>/dev/null && return 0
++        pm_cli_alive || return 1
++        [ "$(date +%s)" -ge "${_pm_dl}" ] && return 2
++        sleep 0.2 2>/dev/null || sleep 1
++    done
++}
++
++pm_cli_start() {
++    pm_cli_stop
++    : > "${PM_W}/cli.out" || return 1
++    mkfifo -m 600 "${PM_W}/cli.in" 2>/dev/null || return 1
++    ( pm_cli_exec "${PM_W}/cli.in" ) >> "${PM_W}/cli.out" 2>> "${PM_W}/cli.err" < /dev/null &
++    PM_CLI_PID=$!
++    # FIFO を読み書き両用で開いておく (CLI が EOF を受けて終わらないように)
++    exec 7<> "${PM_W}/cli.in" || { pm_cli_stop; return 1; }
++    PM_CLI_FD=1
++    printf 'echo PERF_READY\n' >&7
++    if ! pm_cli_wait PERF_READY "${PERF_CLI_CONNECT_TIMEOUT}"; then
++        pm_cli_stop
++        return 1
++    fi
++    pm_log INFO "jboss-cli の常駐セッションを開始しました (pid=${PM_CLI_PID}, ${PM_CLI_CTRL})"
++    return 0
++}
++
++# 1 回分の問い合わせ。応答が最後まで揃えば 0。
++pm_cli_exchange() {  # seq block-file
++    : > "${PM_W}/cli.out"
++    pm_cli_alive || return 1
++    { printf 'echo PERF_S %s\n' "$1"; cat "$2"; printf 'echo PERF_E %s\n' "$1"; } >&7 2>/dev/null || return 1
++    pm_cli_wait "PERF_E $1" "${PERF_CLI_TIMEOUT}"
++    case $? in
++        0) return 0 ;;
++        2) pm_log WARN "jboss-cli が ${PERF_CLI_TIMEOUT} 秒以内に応答しません。セッションを作り直します" ;;
++    esac
++    pm_cli_stop
++    return 1
++}
++
++# プール統計が無効なデータソースを実行時に有効化する (statistics=pool の実行時属性)
++pm_cli_enable_stats() {  # seq
++    : > "${PM_W}/enable.cli"
++    while IFS="$(printf '\t')" read -r _pm_ty _pm_dn; do
++        [ -n "${_pm_dn}" ] || continue
++        pm_cli_q en "/subsystem=datasources/${_pm_ty}=$(pm_cli_quote "${_pm_dn}")/statistics=pool:write-attribute(name=statistics-enabled,value=true)" \
++            >> "${PM_W}/enable.cli"
++        pm_log INFO "データソース ${_pm_dn} のプール統計を実行時に有効化します (設定ファイルは変えません)"
++    done < "${PM_W}/cli.enable"
++    if pm_cli_exchange "$1" "${PM_W}/enable.cli"; then
++        [ -n "${PM_EN_META:-}" ] || pm_meta cli ds_stats_enabled_at_runtime "$(date '+%Y-%m-%d %H:%M:%S')"
++        PM_EN_META=1
++    else
++        pm_log WARN "データソースのプール統計を有効化できませんでした"
++    fi
++}
++
++pm_os_threads() {  # pid -> /proc/<pid>/status の Threads
++    sed -n 's/^Threads:[[:space:]]*//p' "/proc/$1/status" 2>/dev/null
++}
++
++pm_cli_parse() {  # ok cli_ms
++    pm_jboss_alive || PM_JPID="$(pm_find_jboss_pid)" || PM_JPID=""
++    _pm_os=""
++    [ -n "${PM_JPID}" ] && _pm_os="$(pm_os_threads "${PM_JPID}")"
++    _pm_en=""
++    [ "${PERF_CLI_ENABLE_DS_STATS}" = "true" ] && _pm_en="${PM_W}/cli.enable"
++    awk -v ts="${PM_TS}" -v epoch="${PM_EPOCH}" -v cli_ms="$2" -v ok="$1" -v pid="${PM_JPID}" -v osthr="${_pm_os}" \
++        -v dir="${PM_OUT}" -v enlist="${_pm_en}" -v failf="${PM_W}/cli.fail" -v metaf="${PM_OUT}/perf_meta.csv" \
++        -f "${PM_W}/cli.awk" "${PM_W}/cli.out" 2>> "${PM_W}/cli.err"
++}
++
++pm_run_cli() {
++    PM_NAME=cli
++    PM_CLI_FD=0; PM_CLI_PID=""
++    trap 'pm_cli_stop; exit 0' TERM INT
++    pm_wait_jboss || exit 0
++    if ! pm_cli_resolve; then
++        pm_log WARN "jboss-cli.sh が見つかりません (JBOSS_HOME=${JBOSS_HOME:-})。① の取得を終了します"
++        exit 0
++    fi
++    printf '%s\n' "${PM_CLI_AWK}" > "${PM_W}/cli.awk"
++    awk -v mode=header -v dir="${PM_OUT}" -f "${PM_W}/cli.awk" /dev/null
++    pm_cli_sample_block > "${PM_W}/sample.cli"
++    pm_cli_meta_block > "${PM_W}/meta.cli"
++    pm_meta cli controller "${PM_CLI_CTRL}"
++    pm_log INFO "① jboss-cli: ${PERF_CLI_INTERVAL} 秒間隔 (${PM_CLI_CTRL})"
++    _pm_seq=0; _pm_fail=0; _pm_en_last=0; _pm_retry=5; _pm_meta_done=0
++    _pm_conn_dl=$(( $(date +%s) + PERF_WAIT_TIMEOUT ))
++    while :; do
++        if ! pm_cli_alive && ! pm_cli_start; then
++            if [ "$(date +%s)" -ge "${_pm_conn_dl}" ]; then
++                pm_warn_once noconn "管理インタフェース (${PM_CLI_CTRL}) に ${PERF_WAIT_TIMEOUT} 秒たっても接続できません。60 秒ごとに再試行します。詳細: ${PM_W}/cli.err"
++                _pm_retry=60
++            fi
++            # 接続できない間も OS スレッド数は記録する (スレッドが枯渇して管理インタフェースが
++            # 応答しないときこそ手がかりになるため)
++            pm_now
++            : > "${PM_W}/cli.out"
++            pm_cli_parse 0 ""
++            sleep "${_pm_retry}"
++            continue
++        fi
++        if [ "${_pm_meta_done}" = 0 ]; then
++            _pm_seq=$((_pm_seq + 1))
++            if pm_cli_exchange "${_pm_seq}" "${PM_W}/meta.cli"; then
++                awk -v mode=meta -v metaf="${PM_OUT}/perf_meta.csv" -v dir="${PM_OUT}" -f "${PM_W}/cli.awk" "${PM_W}/cli.out"
++                _pm_meta_done=1
++            fi
++        fi
++        pm_now
++        _pm_seq=$((_pm_seq + 1))
++        rm -f "${PM_W}/cli.enable"
++        _pm_t0="$(pm_ms)"
++        _pm_ok=0
++        # jboss-cli はサーバーの再起動後に自分で再接続する。その間の操作は catch 側 (PERF_F) に入る
++        if pm_cli_exchange "${_pm_seq}" "${PM_W}/sample.cli" && ! grep -q '^PERF_F dsp\.ds$' "${PM_W}/cli.out"; then _pm_ok=1; fi
++        _pm_t1="$(pm_ms)"
++        pm_cli_parse "${_pm_ok}" "$((_pm_t1 - _pm_t0))"
++        if [ "${_pm_ok}" = 1 ]; then
++            [ "${_pm_fail}" -gt 0 ] && pm_log INFO "① jboss-cli の取得を再開しました (失敗 ${_pm_fail} 回)"
++            _pm_fail=0
++        else
++            _pm_fail=$((_pm_fail + 1))
++            [ "${_pm_fail}" = 1 ] && pm_log WARN "① jboss-cli の取得に失敗しました (seq=${_pm_seq})。続けて試します。詳細: ${PM_W}/cli.err"
++        fi
++        # プール統計が無効なデータソースは実行時に有効化する (60 秒に 1 回まで)
++        if [ -s "${PM_W}/cli.enable" ] && [ $(( PM_EPOCH - _pm_en_last )) -ge 60 ]; then
++            _pm_en_last="${PM_EPOCH}"
++            _pm_seq=$((_pm_seq + 1))
++            pm_cli_enable_stats "${_pm_seq}"
++        fi
++        pm_sleep_tick "${PERF_CLI_INTERVAL}"
++    done
++}
++
++# =============================================================================
++# ② jstat
++# =============================================================================
++# jstat は「間隔」を指定して 1 つだけ常駐させ、出力の各行に時刻を付けて CSV にする。
++# 標準の -gc の列に、セーフポイント・スレッド数・クラス数・JIT 時間・直近の GC の原因を
++# 足したカスタムオプション perfgc を使う (jstat は <user.home>/.jvmstat/jstat_options を読む)。
++# カウンタ名・書式は JDK 21 の jstat_options (-gc / -gccause / -class / -compiler) と同じ。
++PM_JSTAT_OPTIONS='option perfgc {
++  column { header "^S0C^" data sun.gc.generation.0.space.1.capacity scale K align right width 11 format "0.0" }
++  column { header "^S1C^" data sun.gc.generation.0.space.2.capacity scale K align right width 11 format "0.0" }
++  column { header "^S0U^" data sun.gc.generation.0.space.1.used scale K align right width 11 format "0.0" }
++  column { header "^S1U^" data sun.gc.generation.0.space.2.used scale K align right width 11 format "0.0" }
++  column { header "^EC^" data sun.gc.generation.0.space.0.capacity align right scale K width 12 format "0.0" }
++  column { header "^EU^" data sun.gc.generation.0.space.0.used align right scale K width 12 format "0.0" }
++  column { header "^OC^" data sun.gc.generation.1.space.0.capacity align right scale K width 12 format "0.0" }
++  column { header "^OU^" data sun.gc.generation.1.space.0.used align right width 12 scale K format "0.0" }
++  column { header "^MC^" data sun.gc.metaspace.capacity align right width 10 scale K format "0.0" }
++  column { header "^MU^" data sun.gc.metaspace.used align right width 10 scale K format "0.0" }
++  column { header "^CCSC^" data sun.gc.compressedclassspace.capacity align right width 9 scale K format "0.0" }
++  column { header "^CCSU^" data sun.gc.compressedclassspace.used align right width 9 scale K format "0.0" }
++  column { header "^YGC^" data sun.gc.collector.0.invocations align right width 6 format "0" }
++  column { header "^YGCT^" data sun.gc.collector.0.time/sun.os.hrt.frequency align right width 9 scale sec format "0.000" }
++  column { header "^FGC^" data sun.gc.collector.1.invocations align right width 5 scale raw format "0" }
++  column { header "^FGCT^" data sun.gc.collector.1.time/sun.os.hrt.frequency align right width 9 scale sec format "0.000" }
++  column { header "^CGC^" data sun.gc.collector.2.invocations align right width 5 scale raw format "0" }
++  column { header "^CGCT^" data sun.gc.collector.2.time/sun.os.hrt.frequency align right width 9 scale sec format "0.000" }
++  column { header "^GCT^" data (sun.gc.collector.0.time + sun.gc.collector.1.time + sun.gc.collector.2.time)/sun.os.hrt.frequency align right width 9 scale sec format "0.000" required true }
++  column { header "^SPN^" data sun.rt.safepoints align right width 8 scale raw format "0" }
++  column { header "^SPT^" data sun.rt.safepointTime/sun.os.hrt.frequency align right width 10 scale sec format "0.000" }
++  column { header "^SPS^" data sun.rt.safepointSyncTime/sun.os.hrt.frequency align right width 10 scale sec format "0.000" }
++  column { header "^THR^" data java.threads.live align right width 6 scale raw format "0" }
++  column { header "^DTHR^" data java.threads.daemon align right width 6 scale raw format "0" }
++  column { header "^PTHR^" data java.threads.livePeak align right width 6 scale raw format "0" }
++  column { header "^CLS^" data (java.cls.loadedClasses + java.cls.sharedLoadedClasses) align right width 7 scale raw format "0" }
++  column { header "^UCLS^" data (java.cls.unloadedClasses + java.cls.sharedUnloadedClasses) align right width 6 scale raw format "0" }
++  column { header "^CMP^" data sun.ci.totalCompiles align right width 7 scale raw format "0" }
++  column { header "^CMPT^" data java.ci.totalTime/sun.os.hrt.frequency align right width 9 scale sec format "0.000" }
++  column { header "^LGCC" data sun.gc.lastCause align left width 20 scale raw }
++}'
++
++# jstat の出力 (空白区切り・先頭列が JVM の稼働秒) を、時刻付きの CSV にする。
++# 最後の列 LGCC (GC の原因) は空白を含むので、見出しの列数より後ろは 1 つの値にまとめる。
++pm_jstat_csv() {  # csv-file
++    _pm_f="$1"
++    _pm_nh=0
++    set -f
++    while IFS= read -r _pm_l; do
++        # shellcheck disable=SC2086
++        set -- ${_pm_l}
++        case "${1:-}" in
++            Timestamp)
++                shift
++                _pm_nh=$#
++                [ -s "${_pm_f}" ] || ( IFS=,; printf 'timestamp,epoch,uptime_s,%s\n' "$*" ) >> "${_pm_f}"
++                ;;
++            [0-9]*)
++                [ "${_pm_nh}" -gt 0 ] || continue
++                pm_now
++                # 先頭 = 稼働秒、続く (見出しの列数 - 1) 個 = 各列、残り全部 = 最後の列
++                _pm_row="${PM_TS},${PM_EPOCH},$1"; shift
++                _pm_i=1; _pm_tail=""
++                for _pm_v in "$@"; do
++                    if [ "${_pm_i}" -lt "${_pm_nh}" ]; then _pm_row="${_pm_row},${_pm_v}"
++                    else _pm_tail="${_pm_tail}${_pm_tail:+ }${_pm_v}"; fi
++                    _pm_i=$((_pm_i + 1))
++                done
++                case "${_pm_tail}" in *[!0-9.-]*) _pm_tail="\"$(printf '%s' "${_pm_tail}" | tr -d '"')\"" ;; esac
++                printf '%s,%s\n' "${_pm_row}" "${_pm_tail}" >> "${_pm_f}"
++                ;;
++        esac
++    done
++    set +f
++}
++
++# /tmp の hsperfdata に、このコンテナの JVM ではないもの (他のコンテナと /tmp を共有) があるか
++pm_hsperf_shared_check() {
++    for _pm_h in /tmp/hsperfdata_*/*; do
++        [ -e "${_pm_h}" ] || continue
++        _pm_hp="${_pm_h##*/}"
++        pm_is_uint "${_pm_hp}" || continue
++        if [ ! -r "/proc/${_pm_hp}/cmdline" ] || ! tr '\0' ' ' < "/proc/${_pm_hp}/cmdline" 2>/dev/null | grep -q java; then
++            pm_warn_once hsperfshared "② /tmp/hsperfdata に、このコンテナに無い JVM のカウンタ (${_pm_h}) があります。/tmp を他のコンテナと共有していると PID が重なり、jstat / jcmd が別の JVM を読みます。コンテナごとに別のボリュームを当ててください (終了した JVM の残骸なら問題ありません)"
++            return 0
++        fi
++    done
++    return 0
++}
++
++pm_run_jstat() {
++    PM_NAME=jstat
++    trap 'exit 0' TERM INT
++    pm_wait_jboss || exit 0
++    if ! pm_resolve_tool jstat; then
++        pm_log WARN "② jstat を起動できません (jstat が無く、java に jdk.jcmd モジュールもありません)"
++        exit 0
++    fi
++    mkdir -p "${PM_W}/jstat-home/.jvmstat"
++    printf '%s\n' "${PM_JSTAT_OPTIONS}" > "${PM_W}/jstat-home/.jvmstat/jstat_options"
++    PM_TOOL_SYSPROPS="-Duser.home=${PM_W}/jstat-home"
++    pm_meta jvm jstat_command "$(pm_tool_desc)"
++    _pm_miss=0; _pm_opt=""
++    while :; do
++        pm_jboss_alive || PM_JPID="$(pm_find_jboss_pid)" || { sleep 5; continue; }
++        if ! pm_hsperf_exists "${PM_JPID}"; then
++            # JVM の起動直後はまだ無いことがあるため、30 秒続けて無いときだけ警告する
++            _pm_miss=$((_pm_miss + 1))
++            [ "${_pm_miss}" -ge 3 ] && pm_warn_once "hsperf${PM_JPID}" "② jstat: JVM の性能カウンタ (/tmp/hsperfdata_*/${PM_JPID}) がありません。/tmp が書き込めない、または JBoss に -XX:-UsePerfData / -XX:+PerfDisableSharedMem が指定されています"
++            sleep 10
++            continue
++        fi
++        _pm_miss=0
++        pm_hsperf_shared_check
++        # カスタムオプションが使えるか 1 回だけ確かめる (使えなければ標準の -gc)
++        if [ -z "${_pm_opt}" ]; then
++            if pm_tool_exec -perfgc "${PM_JPID}" 1 1 2>> "${PM_W}/jstat.err" | grep -q 'LGCC'; then _pm_opt=perfgc
++            else _pm_opt=gc; pm_log WARN "② jstat のカスタムオプション perfgc が使えないため -gc で取得します (詳細: ${PM_W}/jstat.err)"; fi
++            pm_meta jvm jstat_option "-${_pm_opt}"
++        fi
++        pm_log INFO "② jstat -${_pm_opt} を開始します (pid=${PM_JPID}, ${PERF_JSTAT_INTERVAL} 秒間隔, $(pm_tool_desc))"
++        pm_tool_exec "-${_pm_opt}" -t "${PM_JPID}" "${PERF_JSTAT_INTERVAL}s" 2>> "${PM_W}/jstat.err" | pm_jstat_csv "${PM_OUT}/jvm_jstat_gc.csv"
++        pm_log INFO "② jstat -${_pm_opt} が終了しました。5 秒後に再開します (JVM の再起動・停止の可能性)"
++        sleep 5
++    done
++}
++
++# =============================================================================
++# ② jcmd (GC.heap_info・Compiler.codecache・Thread.print・VM.native_memory)・JFR の管理
++# ④ CPU 数の判断材料 (JVM ごとに 1 回)
++# =============================================================================
++# jcmd は 1 回ごとに JVM を起動するため、間隔ごとのコマンドは -f でまとめて 1 回で実行する。
++# その出力 (区切り無しで続く) を、各コマンドの決まった書き出しで見分けて CSV にする。
++PM_JCMD_AWK='
++function kb(s,    n, u) {
++  n = s; sub(/[KMGkmgBb]+$/, "", n); u = toupper(substr(s, length(n) + 1, 1))
++  n = n + 0; if (u == "M") n *= 1024; else if (u == "G") n *= 1048576; else if (u == "B") n = n / 1024
++  return int(n)
++}
++function num(line, word,    re, s) { re = word "[ =]+[0-9]+[KMGBkb]*"; if (match(line, re)) { s = substr(line, RSTART, RLENGTH); sub(word "[ =]+", "", s); return kb(s) } return "" }
++function csvq(s) { if (s ~ /[",\r\n]/) { gsub(/"/, "\"\"", s); return "\"" s "\"" } return s }
++function jgroup(n) {
++  if (n ~ /^(MSC service thread|ServerService Thread|management |DeploymentScanner|Transaction Reaper|Transaction Expired|Periodic Recovery|IdleRemover|Reference Reaper|Controller Boot|ElytronTimer)/) return "jboss"
++  if (n ~ / task-[0-9]+$/) return "http-task"
++  if (n ~ / I\/O-[0-9]+$/ || n ~ / Accept$/) return "http-io"
++  if (n ~ /^(EE-Managed|EJB )/) return "ee-ejb"
++  if (n ~ /^(Reference Handler|Finalizer|Signal Dispatcher|Service Thread|Monitor Deflation|C[12] CompilerThread|Common-Cleaner|Notification Thread|Attach Listener|JFR |Sweeper|process reaper)/) return "jvm"
++  return "other"
++}
++function cnt(g, st, idle) {
++  if (!(g in TOT)) GO[++NG] = g
++  TOT[g]++
++  if (st == "RUNNABLE") RUN[g]++; else if (st == "BLOCKED") BLK[g]++; else if (st == "WAITING") WAI[g]++; else if (st == "TIMED_WAITING") TWA[g]++
++  if (!idle) BUSY[g]++
++}
++function endthread(    g, st, idle) {
++  if (TN == "") return
++  g = jgroup(TN); st = TS2
++  idle = (FNJ ~ /^org\.jboss\.threads\.(EnhancedQueueExecutor\$ThreadBody\.run|JBossThread\.run)/ || IDLE) ? 1 : 0
++  cnt("all", st, idle); cnt(g, st, idle)
++  if (DBW && st ~ /WAITING/) cnt("db-pool-wait", st, 0)
++  TN = ""
++}
++BEGIN { SQ = sprintf("%c", 39); NG = 0; NC = 0; NN = 0 }
++# ---- GC.heap_info ----
++/garbage-first heap|Shenandoah Heap|ZHeap|^ *ZGC/ {
++  gc = ($0 ~ /garbage-first/) ? "G1" : ($0 ~ /Shenandoah/) ? "Shenandoah" : "Z"
++  ht = num($0, "total"); hc = num($0, "committed"); hr = num($0, "reserved"); hu = num($0, "used")
++  if (ht == "" && hc != "") ht = hc
++  HEAP = 1; next
++}
++/region size/ && !TD {
++  rs = num($0, "region size")
++  if (match($0, /[0-9]+ young \([0-9]+[KMG]\)/)) { s = substr($0, RSTART, RLENGTH); split(s, a, /[ ()]+/); yr = a[1]; yk = kb(a[3]) }
++  if (match($0, /[0-9]+ survivors \([0-9]+[KMG]\)/)) { s = substr($0, RSTART, RLENGTH); split(s, a, /[ ()]+/); sr = a[1]; sk = kb(a[3]) }
++  next
++}
++/(def new generation|PSYoungGen|par new generation)/ && !TD { if (gc == "") gc = ($0 ~ /PSYoungGen/) ? "Parallel" : "Serial"; ygt = num($0, "total"); ygu = num($0, "used"); HEAP = 1; next }
++/(tenured generation|ParOldGen)/ && !TD { ogt = num($0, "total"); ogu = num($0, "used"); next }
++/^ *Metaspace +used/ && !TD { mu = num($0, "used"); mc = num($0, "committed"); mr = num($0, "reserved"); next }
++/^ *class space +used/ && !TD { cu = num($0, "used"); cc = num($0, "committed"); cr = num($0, "reserved"); next }
++# ---- Compiler.codecache ----
++index($0, "CodeHeap " SQ) == 1 {
++  s = $0; sub("^CodeHeap " SQ, "", s); nm = s; sub(SQ ".*$", "", nm)
++  NC++; CN[NC] = nm; CS[NC] = num($0, "size"); CU[NC] = num($0, "used"); CM[NC] = num($0, "max_used"); CF[NC] = num($0, "free")
++  next
++}
++/^CodeCache:/ { NC++; CN[NC] = "CodeCache (total)"; CS[NC] = num($0, "size"); CU[NC] = num($0, "used"); CM[NC] = num($0, "max_used"); CF[NC] = num($0, "free"); CT = NC; next }
++/total_blobs=/ { s = $0; if (match(s, /full_count=[0-9]+/)) FULL = substr(s, RSTART + 11, RLENGTH - 11); if (match(s, /nmethods=[0-9]+/)) NMETH = substr(s, RSTART + 9, RLENGTH - 9); next }
++# ---- VM.native_memory summary ----
++/^Native Memory Tracking:/ { NMT = 1; next }
++NMT && /^Total: reserved=/ { NN++; NMN[NN] = "Total"; NMR[NN] = num($0, "reserved"); NMC[NN] = num($0, "committed"); next }
++NMT && /^-[ ]+[^(]+ \(reserved=/ {
++  s = $0; sub(/^-[ ]+/, "", s); nm = s; sub(/ \(reserved=.*$/, "", nm)
++  NN++; NMN[NN] = nm; NMR[NN] = num($0, "reserved"); NMC[NN] = num($0, "committed"); next
++}
++# ---- Thread.print ----
++/^Full thread dump / { TD = 1; NMT = 0; next }
++TD && /^"/ {
++  endthread()
++  if ($0 ~ /^"[^"]*" #[0-9]+/) { s = $0; sub(/^"/, "", s); TN = s; sub(/" #[0-9]+.*$/, "", TN); TS2 = ""; FNJ = ""; IDLE = 0; DBW = 0 }
++  next
++}
++TD && TN != "" && /java\.lang\.Thread\.State: / { s = $0; sub(/^.*java\.lang\.Thread\.State: /, "", s); sub(/ .*$/, "", s); TS2 = s; next }
++TD && TN != "" && /^[ \t]+at / {
++  s = $0; sub(/^[ \t]+at /, "", s); sub(/\(.*$/, "", s)
++  if (FNJ == "" && s !~ /^(java|jdk|sun|javax)\./) FNJ = s
++  if (s ~ /ThreadPoolExecutor\.getTask|DelayedWorkQueue\.take|ForkJoinPool\.awaitWork/) IDLE = 1
++  # 接続プールから接続を取ろうとして待っている (IdleRemover などプールの管理スレッドは除く)
++  if (s ~ /connectionmanager\.pool/ && s ~ /(getConnection|tryAcquire)$/) DBW = 1
++  next
++}
++TD && /^JNI global refs/ { endthread(); TD = 0; TDDONE = 1; next }
++END {
++  pre = csvq(ts) "," epoch
++  if (HEAP) {
++    if (ht == "" && ygt != "") { ht = ygt + ogt; hu = ygu + ogu }
++    print pre "," gc "," ht "," hc "," hr "," hu "," rs "," yr "," yk "," sr "," sk "," ygt "," ygu "," ogt "," ogu "," mu "," mc "," mr "," cu "," cc "," cr "," ms >> (dir "/jvm_jcmd_heap.csv")
++  }
++  for (i = 1; i <= NC; i++) print pre "," csvq(CN[i]) "," CS[i] "," CU[i] "," CM[i] "," CF[i] "," (i == CT ? NMETH : "") "," (i == CT ? FULL : "") >> (dir "/jvm_codecache.csv")
++  for (i = 1; i <= NN; i++) print pre "," csvq(NMN[i]) "," NMR[i] "," NMC[i] >> (dir "/jvm_nmt.csv")
++  if (TD) endthread()
++  if (TD || TDDONE) {
++    for (i = 1; i <= NG; i++) { g = GO[i]; print pre "," g "," TOT[g] + 0 "," RUN[g] + 0 "," BLK[g] + 0 "," WAI[g] + 0 "," TWA[g] + 0 "," BUSY[g] + 0 >> (dir "/jvm_thread_states.csv") }
++  }
++}
++'
++
++PM_JCMD_HEAP_H="timestamp,epoch,gc,heap_total_kb,heap_committed_kb,heap_reserved_kb,heap_used_kb,region_size_kb,young_regions,young_kb,survivor_regions,survivor_kb,young_gen_total_kb,young_gen_used_kb,old_gen_total_kb,old_gen_used_kb,metaspace_used_kb,metaspace_committed_kb,metaspace_reserved_kb,class_used_kb,class_committed_kb,class_reserved_kb,jcmd_ms"
++PM_JCMD_CC_H="timestamp,epoch,segment,size_kb,used_kb,max_used_kb,free_kb,nmethods,full_count"
++PM_JCMD_NMT_H="timestamp,epoch,category,reserved_kb,committed_kb"
++PM_JCMD_TS_H="timestamp,epoch,group,total,runnable,blocked,waiting,timed_waiting,busy"
++PM_CPU_ENV_H="timestamp,epoch,pid,category,key,value,note"
++
++pm_jcmd_run() {  # out-file command...
++    _pm_of="$1"; shift
++    pm_tool_exec "${PM_JPID}" "$@" > "${_pm_of}" 2>> "${PM_W}/jcmd.err"
++}
++
++pm_threaddump() {
++    mkdir -p "${PM_OUT}/threaddump" 2>/dev/null
++    _pm_td="${PM_OUT}/threaddump/threaddump_$(date '+%Y%m%d_%H%M%S').txt"
++    if pm_jcmd_run "${PM_W}/td.tmp" Thread.print -l; then
++        { echo "# $(date '+%Y-%m-%d %H:%M:%S') jcmd ${PM_JPID} Thread.print -l"; cat "${PM_W}/td.tmp"; } > "${_pm_td}"
++        pm_log INFO "スレッドダンプを取得しました: ${_pm_td}"
++        echo "${_pm_td}"
++    else
++        pm_log WARN "スレッドダンプを取得できませんでした (詳細: ${PM_W}/jcmd.err)"
++        return 1
++    fi
++}
++
++# JFR の記録が JBoss で動いているか確かめ、無ければ (PERF_JFR=true のとき) jcmd で始める
++pm_jfr_ensure() {
++    [ "${PERF_JFR}" = "true" ] || { pm_meta jfr state "off"; return 0; }
++    case "${PM_JFR_MODE}" in off) pm_meta jfr state "off (${PM_JFR_MODE})"; return 0 ;; esac
++    pm_jcmd_run "${PM_W}/jfr.chk" JFR.check || { pm_log WARN "② JFR.check に失敗しました (詳細: ${PM_W}/jcmd.err)"; return 1; }
++    if grep -q 'name=perf-metrics' "${PM_W}/jfr.chk"; then
++        pm_meta jfr state "running (${PM_JFR_MODE})"
++        pm_log INFO "② JFR: 記録 perf-metrics が動いています ($(grep 'name=perf-metrics' "${PM_W}/jfr.chk" | head -n 1 | sed 's/^ *//'))"
++        return 0
++    fi
++    if [ "${PM_JFR_MODE}" = user ]; then
++        pm_meta jfr state "user ($(grep -c '^Recording' "${PM_W}/jfr.chk") recordings)"
++        return 0
++    fi
++    # 起動時のオプションが効いていない (CMD が standalone.sh ではない・PRESERVE_JAVA_OPTS 等) → jcmd で始める
++    mkdir -p "${PM_JFR_DIR}/repo" 2>/dev/null
++    pm_jcmd_run "${PM_W}/jfr.cfg" JFR.configure "repositorypath=${PM_JFR_DIR}/repo" preserve-repository=true \
++        || pm_log WARN "② JFR.configure に失敗しました (リポジトリは既定の /tmp になります)"
++    set -f
++    # shellcheck disable=SC2046
++    if pm_jcmd_run "${PM_W}/jfr.start" JFR.start $(pm_jfr_items ' '); then
++        set +f
++        pm_meta jfr state "started-by-jcmd"
++        pm_log INFO "② JFR: jcmd JFR.start で記録を始めました (${PM_JFR_DIR})"
++    else
++        set +f
++        pm_meta jfr state "start-failed"
++        pm_log WARN "② JFR を開始できませんでした (詳細: ${PM_W}/jcmd.err)"
++    fi
++}
++
++# ---- JSON (ECS タスクメタデータ) を「パス<TAB>値」の行にする小さな解析器 ----
++PM_JSON_AWK='
++function skipws(    c) { while (i <= n) { c = substr(buf, i, 1); if (c == " " || c == "\t" || c == "\n" || c == "\r") i++; else break } }
++function pstr(    s, c, e) {
++  s = ""; i++
++  while (i <= n) {
++    c = substr(buf, i, 1)
++    if (c == "\\") { e = substr(buf, i + 1, 1); if (e == "u") { s = s "?"; i += 6; continue } if (e == "n" || e == "t" || e == "r") s = s " "; else s = s e; i += 2; continue }
++    if (c == "\"") { i++; return s }
++    s = s c; i++
++  }
++  return s
++}
++function pval(p,    c, k, idx, s) {
++  skipws(); c = substr(buf, i, 1)
++  if (c == "{") {
++    i++; skipws(); if (substr(buf, i, 1) == "}") { i++; return }
++    while (i <= n) {
++      skipws(); if (substr(buf, i, 1) != "\"") return
++      k = pstr(); skipws(); i++
++      pval(p == "" ? k : p "." k)
++      skipws(); c = substr(buf, i, 1); i++
++      if (c != ",") return
++    }
++    return
++  }
++  if (c == "[") {
++    i++; skipws(); if (substr(buf, i, 1) == "]") { i++; return }
++    idx = 0
++    while (i <= n) {
++      pval(p "." idx); idx++
++      skipws(); c = substr(buf, i, 1); i++
++      if (c != ",") return
++    }
++    return
++  }
++  if (c == "\"") { print p "\t" pstr(); return }
++  s = ""
++  while (i <= n) { c = substr(buf, i, 1); if (c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\r" || c == "\n") break; s = s c; i++ }
++  print p "\t" s
++}
++{ buf = buf $0 "\n" }
++END { n = length(buf); i = 1; pval("") }
++'
++
++# サイドカー (JVM を動かさないと分かっているコンテナ) の名前・イメージの目印
++PM_SIDECAR_RE='cloudwatch-agent|cwagent|aws-otel|adot|otel-collector|fluent|firelens|log_router|envoy|appmesh|xray|datadog|newrelic|ecs-exec|ssm-agent'
++
++# ④ の判定 (pm_cpu_env から呼ぶ。単体試験でも使う)
++#   入力: tcpu=タスクの vCPU ccpu=コンテナの CPU ユニット napp=JVM のコンテナ数 q=クォータ (コア)
++#         apc=ActiveProcessorCount eff=JVM が認識した CPU 数 gc=選ばれた GC gco=その由来
++#   出力: 結果<TAB>推奨値<TAB>取り分 (vCPU)<TAB>説明
++PM_JUDGE_AWK='
++  function ceil(x) { return (x == int(x)) ? x : int(x) + 1 }
++  BEGIN {
++    share = ""; how = ""
++    # コンテナの cpu が未指定でも、ECS は最小のシェア (2 など) を入れることがあるため 64 未満は未指定と見なす
++    if (ccpu + 0 >= 64) { share = ccpu / 1024; how = "コンテナ定義の cpu " ccpu " ユニット" }
++    else if (tcpu + 0 > 0) { n = (napp + 0 > 0) ? napp : 1; share = tcpu / n; how = "タスクの " tcpu " vCPU を JVM のコンテナ " n " 個で分けた値" }
++    else if (q + 0 > 0) { share = q; how = "cgroup のクォータ" }
++    rec = ""
++    if (share != "") { rec = int(share + 0.5); if (rec < 1) rec = 1; share = sprintf("%.2f", share); sub(/\.?0+$/, "", share) }
++    r = ""; msg = ""
++    if (apc + 0 > 0) {
++      r = "設定済み"; msg = "-XX:ActiveProcessorCount=" apc " が指定されています"
++      if (tcpu + 0 > 0 && apc > ceil(tcpu)) { r = "要確認"; msg = msg "。タスクの vCPU (" tcpu ") を超えています" }
++      else if (rec != "" && apc != rec) msg = msg "。取り分の目安は " rec " (" how ")"
++    } else if (eff == "") {
++      r = "判定不可"; msg = "JVM が認識した CPU 数を取得できません"
++    } else if (rec == "") {
++      r = "判定不可"; msg = "ECS メタデータ・クォータが無く、割り当てられた CPU が分かりません (JVM は " eff " CPU と認識)"
++    } else if (eff + 0 > rec + 0) {
++      r = "要"; msg = "JVM は CPU を " eff " 個と認識していますが、このコンテナの取り分は約 " share " vCPU (" how ") です"
++      if (q == "") msg = msg "。cgroup に CPU の上限 (クォータ) が無いため、JVM はタスクの VM の CPU 数をそのまま使います"
++      msg = msg "。GC・JIT・Undertow (I/O・タスク) などのスレッド数が " eff " CPU 前提で作られるため、-XX:ActiveProcessorCount=" rec " の指定を推奨します"
++      if (napp + 0 > 1 && ccpu + 0 < 64) msg = msg "。同じタスクの他の JVM のコンテナも同じ CPU 数を前提にします"
++    } else if (eff + 0 == rec + 0) {
++      r = "不要"; msg = "JVM の認識 (" eff " CPU) と取り分 (約 " share " vCPU、" how ") が一致しています"
++    } else {
++      r = "要検討"; msg = "JVM の認識 (" eff " CPU) が取り分 (約 " share " vCPU) より少ないため、-XX:ActiveProcessorCount=" rec " で増やせます"
++    }
++    if (eff + 0 == 1 && gc == "Serial" && gco ~ /ergonomic/) msg = msg "。CPU 1 と判定されたため SerialGC が自動で選ばれています (2 以上で G1)。ActiveProcessorCount=2 または -XX:+UseG1GC の明示を検討してください"
++    printf "%s\t%s\t%s\t%s\n", r, rec, share, msg
++  }
++'
++
++# ④ -XX:ActiveProcessorCount の判断材料を集めて cpu_env.csv に書き、判定する (JVM ごとに 1 回)
++pm_cpu_env() {
++    _pm_f="${PM_OUT}/cpu_env.csv"
++    pm_csv_init "${_pm_f}" "${PM_CPU_ENV_H}"
++    pm_now
++    _pm_pre="${PM_TS},${PM_EPOCH},${PM_JPID}"
++    _pm_cr() {  # category key value [note]
++        printf '%s,%s,%s,"%s","%s"\n' "${_pm_pre}" "$1" "$2" "$(printf '%s' "$3" | tr '\n' ' ' | sed 's/"/""/g')" "$(printf '%s' "${4:-}" | tr '\n' ' ' | sed 's/"/""/g')" >> "${_pm_f}"
++    }
++    # ---- ECS (タスク定義で割り当てた CPU) ----
++    _pm_tcpu=""; _pm_ccpu=""; _pm_napp=""; _pm_clist=""
++    if pm_ecs_fetch; then
++        _pm_tcpu="$(pm_jget "${PM_ECS_TASK}" Limits.CPU)"
++        _pm_cname="$(pm_jget "${PM_ECS_CONT}" Name)"
++        _pm_ccpu="$(pm_jget "${PM_ECS_CONT}" Limits.CPU)"
++        _pm_cr ecs launch_type "$(pm_jget "${PM_ECS_TASK}" LaunchType)" ""
++        _pm_cr ecs task_cpu_vcpu "${_pm_tcpu}" "タスク定義の cpu (vCPU 単位。1 vCPU = 1024 CPU ユニット)"
++        _pm_cr ecs task_memory_mib "$(pm_jget "${PM_ECS_TASK}" Limits.Memory)" ""
++        _pm_cr ecs container_name "${_pm_cname}" ""
++        _pm_cr ecs container_cpu_units "${_pm_ccpu}" "コンテナ定義の cpu (CPU ユニット)。空欄・64 未満は未指定と見なす"
++        _pm_cr ecs container_memory_mib "$(pm_jget "${PM_ECS_CONT}" Limits.Memory)" ""
++        # タスク内のコンテナ (Type=NORMAL) と、そのうち JVM を動かすと見なす数 (サイドカーを除く)
++        # (1 行目 = コンテナの一覧、2 行目 = JVM を動かすと見なしたコンテナの数)
++        _pm_ca="$(printf '%s\n' "${PM_ECS_TASK}" | awk -F '\t' -v re="${PM_SIDECAR_RE}" '
++            $1 ~ /^Containers\.[0-9]+\./ { split($1, p, "."); i = p[2]; k = substr($1, length(p[1]) + length(p[2]) + 3); V[i, k] = $2; if (!(i in S)) { S[i] = 1; O[++n] = i } }
++            END {
++              for (j = 1; j <= n; j++) { i = O[j]; t = V[i, "Type"]; if (t != "" && t != "NORMAL") continue
++                nm = V[i, "Name"]; im = V[i, "Image"]; side = (tolower(nm " " im) ~ re) ? "sidecar" : "app"
++                if (side == "app") app++
++                printf "%s(cpu=%s,mem=%s,%s);", nm, V[i, "Limits.CPU"], V[i, "Limits.Memory"], side }
++              printf "\n%d\n", app + 0 }')"
++        _pm_clist="$(printf '%s\n' "${_pm_ca}" | sed -n 1p)"
++        _pm_napp="$(printf '%s\n' "${_pm_ca}" | sed -n 2p)"
++        _pm_cr ecs containers "${_pm_clist}" "app = JVM を動かすと見なしたコンテナ、sidecar = 名前・イメージで判別したサイドカー"
++    else
++        _pm_cr ecs metadata "" "ECS タスクメタデータ (ECS_CONTAINER_METADATA_URI_V4) を取得できません (ECS 外での実行)"
++    fi
++    pm_is_uint "${PERF_JVM_CONTAINERS}" && [ "${PERF_JVM_CONTAINERS}" -gt 0 ] && _pm_napp="${PERF_JVM_CONTAINERS}"
++    _pm_cr ecs jvm_containers "${_pm_napp}" "$(if [ -n "${PERF_JVM_CONTAINERS}" ]; then echo 'PERF_JVM_CONTAINERS で指定'; else echo '自動判定 (PERF_JVM_CONTAINERS で上書き可)'; fi)"
++    # ---- OS から見える CPU ----
++    _pm_nproc="$(nproc 2>/dev/null)"
++    _pm_cr os nproc "${_pm_nproc}" "このプロセスが使える CPU 数 (sched_getaffinity)"
++    _pm_cr os cpus_online "$(getconf _NPROCESSORS_ONLN 2>/dev/null)" "OS が認識しているオンラインの CPU 数 (Fargate では microVM の vCPU 数)"
++    _pm_cr os cpuinfo_processors "$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)" "/proc/cpuinfo"
++    _pm_cr os cpu_model "$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n 1)" ""
++    _pm_cr os cpus_allowed_list "$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' "/proc/${PM_JPID}/status" 2>/dev/null)" "JBoss の JVM が使える CPU (EAP の CPU 数は min(availableProcessors, この数))"
++    _pm_cr os kernel "$(uname -r 2>/dev/null)" ""
++    # ---- cgroup (CPU の上限 = クォータ / 比率 = シェア) ----
++    _pm_q=""
++    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
++        _pm_cr cgroup version 2 ""
++        _pm_cm="$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)"
++        _pm_cr cgroup cpu.max "${_pm_cm}" "クォータ 周期 (max = 上限なし)"
++        _pm_q="$(printf '%s' "${_pm_cm}" | awk '$1 != "max" && $2 > 0 { printf "%.2f", $1 / $2 }')"
++        _pm_cr cgroup cpu.weight "$(cat /sys/fs/cgroup/cpu.weight 2>/dev/null)" "比率 (シェア)。上限ではない"
++        _pm_cr cgroup cpuset.cpus.effective "$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null)" ""
++        _pm_cr cgroup memory.max "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" ""
++        _pm_cr cgroup cpu.pressure "$([ -r /sys/fs/cgroup/cpu.pressure ] && echo available || echo none)" "PSI (CPU の待ち)"
++    else
++        _pm_cr cgroup version 1 ""
++        for _pm_g in /sys/fs/cgroup/cpu /sys/fs/cgroup/cpu,cpuacct /sys/fs/cgroup/cpuacct,cpu; do
++            [ -r "${_pm_g}/cpu.cfs_quota_us" ] || continue
++            _pm_qq="$(cat "${_pm_g}/cpu.cfs_quota_us" 2>/dev/null)"; _pm_pp="$(cat "${_pm_g}/cpu.cfs_period_us" 2>/dev/null)"
++            _pm_cr cgroup cpu.cfs_quota_us "${_pm_qq}" "-1 = 上限なし"
++            _pm_cr cgroup cpu.cfs_period_us "${_pm_pp}" ""
++            _pm_cr cgroup cpu.shares "$(cat "${_pm_g}/cpu.shares" 2>/dev/null)" "比率 (シェア)。上限ではない"
++            _pm_q="$(awk -v q="${_pm_qq}" -v p="${_pm_pp}" 'BEGIN { if (q > 0 && p > 0) printf "%.2f", q / p }')"
++            break
++        done
++        _pm_cr cgroup memory.limit_in_bytes "$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)" ""
++    fi
++    _pm_cr cgroup cpu_quota_cores "${_pm_q}" "クォータから求めた CPU の上限 (空欄 = 上限なし。Fargate は CPU シェアで配分しクォータを使わない)"
++    # ---- JBoss の JVM が認識した CPU 数と、それで決まったスレッド数 ----
++    _pm_apc=""; _pm_eff=""; _pm_gc=""; _pm_gco=""
++    if pm_jcmd_run "${PM_W}/flags.all" VM.flags -all; then
++        for _pm_k in ActiveProcessorCount UseContainerSupport ParallelGCThreads ConcGCThreads CICompilerCount UseG1GC UseSerialGC UseParallelGC UseZGC UseShenandoahGC MaxHeapSize MaxRAMPercentage InitialRAMPercentage MaxDirectMemorySize; do
++            # 例: "     int ActiveProcessorCount   = -1   {product} {default}" (由来は {command line} など空白を含む)
++            _pm_l="$(awk -v k="${_pm_k}" '$2 == k { o = ""; if (match($0, /\{[^}]*\}[ ]*$/)) o = substr($0, RSTART, RLENGTH); sub(/ +$/, "", o); print $4 "\t" o; exit }' "${PM_W}/flags.all")"
++            [ -n "${_pm_l}" ] || continue
++            _pm_v="${_pm_l%%"${PM_TAB}"*}"; _pm_o="${_pm_l#*"${PM_TAB}"}"
++            _pm_cr jvm "${_pm_k}" "${_pm_v}" "${_pm_o}"
++            case "${_pm_k}" in
++                ActiveProcessorCount) _pm_apc="${_pm_v}" ;;
++                UseG1GC|UseSerialGC|UseParallelGC|UseZGC|UseShenandoahGC)
++                    [ "${_pm_v}" = true ] && { _pm_gc="${_pm_k#Use}"; _pm_gc="${_pm_gc%GC}"; _pm_gco="${_pm_o}"; } ;;
++            esac
++        done
++        _pm_cr jvm gc "${_pm_gc}" "${_pm_gco}"
++    fi
++    if pm_jcmd_run "${PM_W}/vminfo.txt" VM.info; then
++        awk '/container \(cgroup\) information:/ { p = 1; next } p && /^$/ { exit } p && /:/ { k = $0; sub(/:.*$/, "", k); v = $0; sub(/^[^:]*: */, "", v); print k "\t" v }' \
++            "${PM_W}/vminfo.txt" > "${PM_W}/vminfo.container"
++        while IFS="${PM_TAB}" read -r _pm_k _pm_v; do
++            [ -n "${_pm_k}" ] || continue
++            _pm_cr jvm_container "${_pm_k}" "${_pm_v}" "jcmd VM.info の container (cgroup) information"
++            [ "${_pm_k}" = active_processor_count ] && _pm_eff="${_pm_v}"
++        done < "${PM_W}/vminfo.container"
++    fi
++    # VM.info に container 情報が無い (JVM がコンテナと判定していない) ときの代わり:
++    #   ActiveProcessorCount の指定値 → 管理インタフェースの availableProcessors → VM.info の CPU 行
++    if [ -z "${_pm_eff}" ] && pm_is_uint "${_pm_apc}" && [ "${_pm_apc}" -gt 0 ]; then
++        _pm_eff="${_pm_apc}"
++    fi
++    if [ -z "${_pm_eff}" ] && [ -s "${PM_OUT}/cli_jvm.csv" ]; then
++        _pm_eff="$(awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "available_processors") c = i; next } c && $c != "" { v = $c } END { print v }' "${PM_OUT}/cli_jvm.csv")"
++        [ -n "${_pm_eff}" ] && _pm_cr jvm available_processors "${_pm_eff}" "jboss-cli の platform-mbean (Runtime.availableProcessors())"
++    fi
++    if [ -z "${_pm_eff}" ] && [ -s "${PM_W}/vminfo.txt" ]; then
++        # 例: "CPU: total 4 (initial active 4) (4 cores per cpu, ...)"
++        _pm_eff="$(sed -n 's/^CPU: total [0-9]* (initial active \([0-9]*\)).*/\1/p' "${PM_W}/vminfo.txt" | head -n 1)"
++        [ -n "${_pm_eff}" ] && _pm_cr jvm initial_active_processors "${_pm_eff}" "jcmd VM.info の CPU 行 (JVM がコンテナと判定していないため、OS の CPU 数をそのまま使っています)"
++    fi
++    # ---- 同じコンテナで、オプション無しの JVM を起動したら何と判定されるか (プローブ) ----
++    _pm_java="$(pm_java_of_jboss)"
++    if [ -n "${_pm_java}" ]; then
++        _pm_probe="$( (unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS; "${_pm_java}" -XX:-UsePerfData -Xshare:auto -XshowSettings:system -version 2>&1) )"
++        printf '%s\n' "${_pm_probe}" | awk -F ': *' '/^ +(Provider|Effective CPU Count|CPU Period|CPU Quota|CPU Shares|List of Processors|Memory Limit|Memory Soft Limit)/ { k = $1; sub(/^ +/, "", k); print k "\t" $2 }' \
++            > "${PM_W}/probe.sys"
++        while IFS="${PM_TAB}" read -r _pm_k _pm_v; do
++            [ -n "${_pm_k}" ] && _pm_cr probe "${_pm_k}" "${_pm_v}" "新しい JVM の -XshowSettings:system"
++        done < "${PM_W}/probe.sys"
++        printf '%s\n' "${_pm_probe}" | grep -q 'System not containerized' && _pm_cr probe containerized false "JVM はコンテナと判定していません (cgroup に CPU / メモリの上限が無い)"
++        _pm_pl="$( (unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS; "${_pm_java}" -XX:-UsePerfData -Xlog:os+container=debug -version 2>&1) | grep -E 'active_processor_count|CPU Quota|CPU Period|CPU Shares|is_containerized|OSContainer::init' | sed 's/^\[[^]]*\]\[[^]]*\]\[[^]]*\] *//' | head -n 8 | tr '\n' ';')"
++        _pm_cr probe os_container_log "${_pm_pl}" "新しい JVM の -Xlog:os+container=debug (CPU 数を決めた経緯)"
++        _pm_pf="$( (unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS; "${_pm_java}" -XX:-UsePerfData -XX:+PrintFlagsFinal -version 2>/dev/null) | awk '$2 ~ /^(ActiveProcessorCount|ParallelGCThreads|ConcGCThreads|CICompilerCount|UseG1GC|UseSerialGC|UseParallelGC)$/ { printf "%s=%s ", $2, $4 }')"
++        _pm_cr probe default_flags "${_pm_pf}" "オプション無しの JVM がこのコンテナで選ぶ値"
++    fi
++    # ---- 判定 ----
++    _pm_j="$(awk -v tcpu="${_pm_tcpu}" -v ccpu="${_pm_ccpu}" -v napp="${_pm_napp}" -v q="${_pm_q}" -v apc="${_pm_apc}" \
++              -v eff="${_pm_eff}" -v gc="${_pm_gc}" -v gco="${_pm_gco}" "${PM_JUDGE_AWK}")"
++    _pm_jr="$(printf '%s' "${_pm_j}" | cut -f1)"; _pm_jrec="$(printf '%s' "${_pm_j}" | cut -f2)"
++    _pm_jsh="$(printf '%s' "${_pm_j}" | cut -f3)"; _pm_jm="$(printf '%s' "${_pm_j}" | cut -f4-)"
++    _pm_cr judgement result "${_pm_jr}" "要 / 要検討 / 不要 / 設定済み / 要確認 / 判定不可"
++    _pm_cr judgement recommended_active_processor_count "${_pm_jrec}" "目安 (取り分を四捨五入、最小 1)"
++    _pm_cr judgement share_vcpu "${_pm_jsh}" "このコンテナの CPU の取り分 (vCPU)"
++    _pm_cr judgement jvm_cpus "${_pm_eff}" "JVM が認識した CPU 数"
++    _pm_cr judgement message "${_pm_jm}" ""
++    pm_log RESULT "④ ActiveProcessorCount: ${_pm_jr} — ${_pm_jm} (cpu_env.csv)"
++}
++
++pm_jcmd_once() {  # JVM ごとに 1 回: 版・フラグ・コマンド行・JFR・④
++    pm_jcmd_run "${PM_W}/jcmd.tmp" VM.version || return 1
++    {
++        echo "# $(date '+%Y-%m-%d %H:%M:%S') jcmd ${PM_JPID} VM.version"; cat "${PM_W}/jcmd.tmp"
++        pm_jcmd_run "${PM_W}/jcmd.tmp2" VM.command_line && { echo "# jcmd ${PM_JPID} VM.command_line"; sed "${PM_MASK_SED}" "${PM_W}/jcmd.tmp2"; }
++        pm_jcmd_run "${PM_W}/jcmd.tmp2" VM.flags && { echo "# jcmd ${PM_JPID} VM.flags"; sed "${PM_MASK_SED}" "${PM_W}/jcmd.tmp2"; }
++    } >> "${PM_OUT}/jvm_info.txt"
++    pm_meta jvm version "$(sed -n '2p' "${PM_W}/jcmd.tmp")"
++    pm_meta jvm pid "${PM_JPID}"
++    pm_jfr_ensure
++    pm_cpu_env
++    return 0
++}
++
++pm_run_jcmd() {
++    PM_NAME=jcmd
++    trap 'exit 0' TERM INT
++    pm_wait_jboss || exit 0
++    if ! pm_resolve_tool jcmd; then
++        pm_log WARN "② jcmd を起動できません (jcmd が無く、java に jdk.jcmd モジュールもありません)"
++        exit 0
++    fi
++    printf '%s\n' "${PM_JCMD_AWK}" > "${PM_W}/jcmd.awk"
++    pm_csv_init "${PM_OUT}/jvm_jcmd_heap.csv" "${PM_JCMD_HEAP_H}"
++    pm_csv_init "${PM_OUT}/jvm_codecache.csv" "${PM_JCMD_CC_H}"
++    [ "${PERF_THREADDUMP}" != off ] && pm_csv_init "${PM_OUT}/jvm_thread_states.csv" "${PM_JCMD_TS_H}"
++    [ "${PERF_NMT}" != off ] && pm_csv_init "${PM_OUT}/jvm_nmt.csv" "${PM_JCMD_NMT_H}"
++    {
++        echo GC.heap_info
++        echo Compiler.codecache
++        [ "${PERF_NMT}" != off ] && echo "VM.native_memory summary scale=KB"
++        [ "${PERF_THREADDUMP}" != off ] && echo Thread.print
++    } > "${PM_W}/jcmd.cmds"
++    pm_meta jvm jcmd_command "$(pm_tool_desc)"
++    pm_log INFO "② jcmd: ${PERF_JCMD_INTERVAL} 秒間隔 ($(tr '\n' ',' < "${PM_W}/jcmd.cmds" | sed 's/,$//'), $(pm_tool_desc))"
++    _pm_done_pid=""; _pm_first=1
++    # JVM の起動直後に ④ の判定ができるよう、最初の数回は 10 秒ごとに試す
++    while :; do
++        pm_jboss_alive || PM_JPID="$(pm_find_jboss_pid)" || { sleep 5; continue; }
++        if [ "${_pm_done_pid}" != "${PM_JPID}" ]; then
++            if pm_jcmd_once; then
++                _pm_done_pid="${PM_JPID}"
++            else
++                [ "${_pm_first}" = 1 ] && pm_log INFO "② jcmd: JVM へまだアタッチできません。続けて試します (詳細: ${PM_W}/jcmd.err)"
++                _pm_first=0
++                pm_is_writable /tmp || pm_warn_once jcmdtmp "② jcmd: /tmp に書き込めないため JVM へアタッチできません (タスク定義で /tmp にボリュームを当ててください)"
++                sleep 10
++                continue
++            fi
++        fi
++        pm_now
++        _pm_t0="$(pm_ms)"
++        if pm_jcmd_run "${PM_W}/jcmd.out" -f "${PM_W}/jcmd.cmds"; then
++            _pm_t1="$(pm_ms)"
++            awk -v ts="${PM_TS}" -v epoch="${PM_EPOCH}" -v ms="$((_pm_t1 - _pm_t0))" -v dir="${PM_OUT}" -f "${PM_W}/jcmd.awk" "${PM_W}/jcmd.out" 2>> "${PM_W}/jcmd.err"
++            if [ "${PERF_THREADDUMP}" = full ]; then
++                mkdir -p "${PM_OUT}/threaddump" 2>/dev/null
++                awk '/^Full thread dump /{p=1} p{print} /^JNI global refs/{exit}' "${PM_W}/jcmd.out" > "${PM_OUT}/threaddump/threaddump_$(date '+%Y%m%d_%H%M%S').txt"
++            fi
++        else
++            pm_warn_once "jcmdf${PM_JPID}" "② jcmd ${PM_JPID} -f に失敗しました (詳細: ${PM_W}/jcmd.err)"
++        fi
++        pm_sleep_tick "${PERF_JCMD_INTERVAL}"
++    done
++}
++
++# =============================================================================
++# ③ top / ps (無いイメージでは /proc から同じ項目を算出) と JBoss のスレッド別・FD・TCP
++# ④ CPU の待ち・steal・スロットリング (cpu_sched.csv)
++# =============================================================================
++pm_role_awk='
++function role(c) {
++  if (c ~ /perf\.metrics\.collector=jboss-cli/) return "jboss-cli"
++  if (c ~ /perf\.metrics\.collector=jstat/) return "jstat"
++  if (c ~ /perf\.metrics\.collector=jcmd/) return "jcmd"
++  if (c ~ /perf\.metrics\.collector=jfr/) return "jfr-csv"
++  if (c ~ /org\.jboss\.as\.cli|jboss-cli/) return "cli-other"
++  if (c ~ /\[Standalone\]|org\.jboss\.as\.standalone/) return "jboss"
++  if (c ~ /standalone\.sh/) return "standalone.sh"
++  if (c ~ /sun\.tools\.(jstat|jcmd)|(^|\/)(jstat|jcmd)( |$)/) return "jdk-tool"
++  if (c ~ /perf-metrics/) return "perf-metrics"
++  if (c ~ /^(\/usr\/bin\/)?top( |$)/) return "top"
++  if (c ~ /^(\/usr\/bin\/)?ps( |$)/) return "ps"
++  return "other"
++}
++function mask(s,    o, k) {
++  o = ""
++  while (match(s, /[A-Za-z0-9_.-]*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][A-Za-z0-9_.-]*[=:][^ ,]*/)) {
++    k = substr(s, RSTART, RLENGTH); sub(/[=:].*/, "", k)
++    o = o substr(s, 1, RSTART - 1) k substr(s, RSTART + length(k), 1) "********"
++    s = substr(s, RSTART + RLENGTH)
++  }
++  return o s
++}
++function csvq(s) { if (s ~ /[",\r\n]/) { gsub(/"/, "\"\"", s); return "\"" s "\"" } return s }
++'
++
++PM_TOP_SUM_H="timestamp,epoch,load1,load5,load15,tasks_total,tasks_running,tasks_sleeping,tasks_stopped,tasks_zombie,cpu_us,cpu_sy,cpu_ni,cpu_id,cpu_wa,cpu_hi,cpu_si,cpu_st,mem_total_mib,mem_free_mib,mem_used_mib,mem_buffcache_mib,swap_total_mib,swap_free_mib,swap_used_mib,mem_avail_mib"
++PM_TOP_PROC_H="timestamp,epoch,pid,role,user,pr,ni,virt_kb,res_kb,shr_kb,state,cpu_pct,mem_pct,time,command"
++PM_TOP_TH_H="timestamp,epoch,rank,tid,thread,state,cpu_pct,time"
++PM_PS_H="timestamp,epoch,pid,ppid,role,user,stat,nlwp,rss_kb,vsz_kb,pcpu,pmem,etimes,cpu_time_s,args"
++# ps -o pid=,ppid=,user=,stat=,nlwp=,rss=,vsz=,pcpu=,pmem=,etimes=,times=,args= の 1 行 → CSV
++PM_PS_AWK='
++{ args = $0; for (k = 1; k <= 11; k++) sub(/^ *[^ ]+/, "", args); sub(/^ +/, "", args); args = mask(args)
++  print ts "," epoch "," $1 "," $2 "," role(args) "," csvq($3) "," $4 "," $5 "," $6 "," $7 "," $8 "," $9 "," $10 "," $11 "," csvq(args) }
++'
++
++# top -b の出力 (要約行とプロセス行) を CSV にする
++PM_TOP_AWK='
++function fullrole(pid, cmd,    r, c, l) {
++  r = role(cmd)
++  if (r != "other" || length(cmd) < 200) return r
++  if (pid in RC) return RC[pid]
++  c = "tr \"\\000\" \" \" < /proc/" pid "/cmdline 2>/dev/null"; l = ""; c | getline l; close(c)
++  RC[pid] = (l == "") ? r : role(l)
++  return RC[pid]
++}
++function getn(s, w,    re, t) { re = "[0-9.]+[ ]+" w; if (match(s, re)) { t = substr(s, RSTART, RLENGTH); sub(/[ ]+.*/, "", t); return t } return "" }
++function tokb(v,    u, n) { u = substr(v, length(v)); if (u ~ /[0-9]/) return v; n = substr(v, 1, length(v) - 1) + 0
++  if (u == "m") n *= 1024; else if (u == "g") n *= 1048576; else if (u == "t") n *= 1073741824; else if (u == "p") n *= 1099511627776
++  return sprintf("%.0f", n) }
++function stamp(    cmd, l) { cmd = "date \"+%Y-%m-%d %H:%M:%S|%s\""; cmd | getline l; close(cmd); split(l, T, "|"); TS = T[1]; EP = T[2] }
++function flush_sum() {
++  if (frame > 1 && TS != "") {
++    print TS "," EP "," L1 "," L5 "," L15 "," TK["total"] "," TK["running"] "," TK["sleeping"] "," TK["stopped"] "," TK["zombie"] \
++      "," C["us"] "," C["sy"] "," C["ni"] "," C["id"] "," C["wa"] "," C["hi"] "," C["si"] "," C["st"] \
++      "," M["total"] "," M["free"] "," M["used"] "," M["buff"] "," S["total"] "," S["free"] "," S["used"] "," M["avail"] >> sumf
++    fflush(sumf)
++  }
++}
++BEGIN { frame = 0 }
++{ if (rawf != "") print mask($0) >> rawf }
++/^top - / {
++  flush_sum(); frame++; inproc = 0; stamp()
++  split("", TK); split("", C); split("", M); split("", S)
++  s = $0; sub(/.*load average: */, "", s); n = split(s, la, /, */); L1 = la[1]; L5 = la[2]; L15 = la[3]
++  if (rawf != "") fflush(rawf)
++  next
++}
++/^(Tasks|Threads):/ { TK["total"] = getn($0, "total"); TK["running"] = getn($0, "running"); TK["sleeping"] = getn($0, "sleeping"); TK["stopped"] = getn($0, "stopped"); TK["zombie"] = getn($0, "zombie"); next }
++/^%Cpu/ { s = $0; sub(/^[^:]*:/, "", s); C["us"] = getn(s, "us"); C["sy"] = getn(s, "sy"); C["ni"] = getn(s, "ni"); C["id"] = getn(s, "id"); C["wa"] = getn(s, "wa"); C["hi"] = getn(s, "hi"); C["si"] = getn(s, "si"); C["st"] = getn(s, "st"); next }
++/^[KMGTP]iB Mem/ {
++  f = 1; u = substr($0, 1, 1); if (u == "K") f = 1 / 1024; else if (u == "G") f = 1024; else if (u == "T") f = 1048576
++  M["total"] = getn($0, "total") * f; M["free"] = getn($0, "free") * f; M["used"] = getn($0, "used") * f; M["buff"] = getn($0, "buff/cache") * f; next
++}
++/^[KMGTP]iB Swap/ {
++  f = 1; u = substr($0, 1, 1); if (u == "K") f = 1 / 1024; else if (u == "G") f = 1024; else if (u == "T") f = 1048576
++  S["total"] = getn($0, "total") * f; S["free"] = getn($0, "free") * f; S["used"] = getn($0, "used") * f; M["avail"] = getn($0, "avail") * f; next
++}
++/^ *PID +USER/ { inproc = 1; next }
++inproc && NF >= 12 && $1 ~ /^[0-9]+$/ {
++  if (frame < 2) next
++  cmd = $0; for (k = 1; k <= 11; k++) sub(/^ *[^ ]+/, "", cmd); sub(/^ +/, "", cmd); cmd = mask(cmd)
++  print TS "," EP "," $1 "," fullrole($1, cmd) "," csvq($2) "," $3 "," $4 "," tokb($5) "," tokb($6) "," tokb($7) "," $8 "," $9 "," $10 "," $11 "," csvq(cmd) >> procf
++  fflush(procf); next
++}
++END { flush_sum() }
++'
++
++# top -b -H -p <JBoss> の出力 (スレッド行) を CSV にする (上位 top 件)
++PM_TOPTH_AWK='
++function stamp(    cmd, l) { cmd = "date \"+%Y-%m-%d %H:%M:%S|%s\""; cmd | getline l; close(cmd); split(l, T, "|"); TS = T[1]; EP = T[2] }
++function csvq(s) { if (s ~ /[",\r\n]/) { gsub(/"/, "\"\"", s); return "\"" s "\"" } return s }
++BEGIN { frame = 0 }
++/^top - / { frame++; inproc = 0; rank = 0; stamp(); next }
++/^ *PID +USER/ { inproc = 1; next }
++inproc && NF >= 12 && $1 ~ /^[0-9]+$/ {
++  if (frame < 2 || rank >= top) next
++  name = $0; for (k = 1; k <= 11; k++) sub(/^ *[^ ]+/, "", name); sub(/^ +/, "", name)
++  rank++
++  print TS "," EP "," rank "," $1 "," csvq(name) "," $8 "," $9 "," $11 >> outf
++  fflush(outf)
++}
++'
++
++# ---- /proc からの算出 (top / ps が無いイメージ) ----
++# 入力は「種類 パス」の行。ファイルは getline で読む (途中で消えたスレッドのファイルは無視)。
++# 前回の値 (CPU 時間など) を状態ファイルに残し、差分から区間の %CPU を求める (top と同じ考え方)。
++PM_PROCTOP_AWK='
++function pstat(l,    a, b, n, rest) {
++  a = index(l, "("); b = 0
++  for (n = length(l); n > a; n--) if (substr(l, n, 1) == ")") { b = n; break }
++  if (a == 0 || b == 0) return 0
++  COMM = substr(l, a + 1, b - a - 1); rest = substr(l, b + 2)
++  split(rest, F, " ")
++  return 1
++}
++function tm(t,    s, m) { s = t / hz; m = int(s / 60); return sprintf("%d:%05.2f", m, s - m * 60) }
++function line(tag, p, l,    k, pid) {
++  if (tag == "prev") { split(l, a, " "); if (a[1] == "ms") PMS = a[2]; else if (a[1] == "cpu") { for (k = 2; k <= 9; k++) PC[k] = a[k] } else if (a[1] == "p") PT[a[2]] = a[3]; else if (a[1] == "t") PTT[a[2]] = a[3]; return }
++  if (tag == "stat" && l ~ /^cpu /) { split(l, a, " "); for (k = 2; k <= 9; k++) NCPU[k] = a[k]; return }
++  if (tag == "loadavg") { split(l, a, " "); L1 = a[1]; L5 = a[2]; L15 = a[3]; return }
++  if (tag == "meminfo") { split(l, a, /[: ]+/); MI[a[1]] = a[2]; return }
++  if (tag == "passwd") { split(l, a, ":"); UN[a[3]] = a[1]; return }
++  if (tag == "pstat") { if (pstat(l)) { pid = p; sub(/^\/proc\//, "", pid); sub(/\/.*$/, "", pid); PS[pid] = F[1]; PPID2[pid] = F[2]; PTK[pid] = F[12] + F[13]; PPR[pid] = F[16]; PNI[pid] = F[17]; PNL[pid] = F[18]; PST[pid] = F[20]; PVS[pid] = F[21]; PCOMM[pid] = COMM; PIDS[++NP] = pid } return }
++  if (tag == "pstatm") { pid = p; sub(/^\/proc\//, "", pid); sub(/\/.*$/, "", pid); split(l, a, " "); PRS[pid] = a[2]; PSH[pid] = a[3]; return }
++  if (tag == "pstatus") { if (l ~ /^Uid:/) { pid = p; sub(/^\/proc\//, "", pid); sub(/\/.*$/, "", pid); split(l, a, /[ \t]+/); PU[pid] = a[3] } return }
++  if (tag == "pcmd") { pid = p; sub(/^\/proc\//, "", pid); sub(/\/.*$/, "", pid); gsub(/\000/, " ", l); PCMD[pid] = PCMD[pid] l; return }
++  if (tag == "tstat") { if (pstat(l)) { k = p; sub(/^.*\/task\//, "", k); sub(/\/.*$/, "", k); TSTA[k] = F[1]; TTK[k] = F[12] + F[13]; TCOMM[k] = COMM; TIDS[++NT] = k } return }
++}
++function rd(p, tag,    l, n) { n = 0; while ((getline l < p) > 0) { n++; line(tag, p, l) } close(p); return n }
++{ tag = $1; p = substr($0, length($1) + 2); rd(p, tag) }
++END {
++  el = (PMS != "") ? (nowms - PMS) / 1000.0 : 0
++  memt = MI["MemTotal"] + 0
++  if (mode == "top") {
++    for (i = 1; i <= NP; i++) { s = PS[PIDS[i]]; ta++; if (s == "R") tr++; else if (s == "T" || s == "t") tt++; else if (s == "Z") tz++; else tsl++ }
++    tot = 0; for (k = 2; k <= 9; k++) { d[k] = NCPU[k] - PC[k]; tot += d[k] }
++    if (el > 0 && tot > 0) {
++      printf "%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n", ts, epoch, L1, L5, L15, ta, tr, tsl, tt, tz, \
++        d[2] * 100 / tot, d[4] * 100 / tot, d[3] * 100 / tot, d[5] * 100 / tot, d[6] * 100 / tot, d[7] * 100 / tot, d[8] * 100 / tot, d[9] * 100 / tot, \
++        memt / 1024, MI["MemFree"] / 1024, (memt - MI["MemFree"] - MI["Buffers"] - MI["Cached"] - MI["SReclaimable"]) / 1024, (MI["Buffers"] + MI["Cached"] + MI["SReclaimable"]) / 1024, \
++        MI["SwapTotal"] / 1024, MI["SwapFree"] / 1024, (MI["SwapTotal"] - MI["SwapFree"]) / 1024, MI["MemAvailable"] / 1024 >> sumf
++      for (i = 1; i <= NP; i++) {
++        pid = PIDS[i]; if (!(pid in PT)) continue
++        cpu = (PTK[pid] - PT[pid]) * 100.0 / (el * hz); if (cpu < 0) cpu = 0
++        cmd = PCMD[pid]; sub(/ +$/, "", cmd); if (cmd == "") cmd = "[" PCOMM[pid] "]"; cmd = mask(cmd)
++        u = (PU[pid] in UN) ? UN[PU[pid]] : PU[pid]
++        printf "%s,%s,%s,%s,%s,%s,%s,%.0f,%.0f,%.0f,%s,%.1f,%.1f,%s,%s\n", ts, epoch, pid, role(cmd), csvq(u), PPR[pid], PNI[pid], PVS[pid] / 1024, PRS[pid] * pagekb, PSH[pid] * pagekb, PS[pid], cpu, \
++          (memt > 0 ? PRS[pid] * pagekb * 100 / memt : 0), tm(PTK[pid]), csvq(cmd) >> procf
++      }
++    }
++    if (topn > 0 && el > 0) {
++      n = 0
++      for (i = 1; i <= NT; i++) { k = TIDS[i]; if (!(k in PTT)) continue; c = (TTK[k] - PTT[k]) * 100.0 / (el * hz); if (c < 0) c = 0; n++; SK[n] = k; SC[n] = c }
++      for (a2 = 1; a2 <= n && a2 <= topn; a2++) { m = a2; for (b2 = a2 + 1; b2 <= n; b2++) if (SC[b2] > SC[m]) m = b2; t = SK[a2]; SK[a2] = SK[m]; SK[m] = t; t = SC[a2]; SC[a2] = SC[m]; SC[m] = t
++        k = SK[a2]; printf "%s,%s,%d,%s,%s,%s,%.1f,%s\n", ts, epoch, a2, k, csvq(TCOMM[k]), TSTA[k], SC[a2], tm(TTK[k]) >> thf }
++    }
++  } else {
++    # ps 相当: 累計の CPU 時間・プロセスの経過時間 (pcpu は ps と同じく「寿命の平均」)
++    for (i = 1; i <= NP; i++) {
++      pid = PIDS[i]; cmd = PCMD[pid]; sub(/ +$/, "", cmd); if (cmd == "") cmd = "[" PCOMM[pid] "]"; cmd = mask(cmd)
++      u = (PU[pid] in UN) ? UN[PU[pid]] : PU[pid]
++      et = uptime - PST[pid] / hz; if (et < 0) et = 0
++      cs = PTK[pid] / hz
++      printf "%s,%s,%s,%s,%s,%s,%s,%s,%.0f,%.0f,%.1f,%.1f,%.0f,%.0f,%s\n", ts, epoch, pid, PPID2[pid], role(cmd), csvq(u), PS[pid], PNL[pid], PRS[pid] * pagekb, PVS[pid] / 1024, \
++        (et > 0 ? cs * 100 / et : 0), (memt > 0 ? PRS[pid] * pagekb * 100 / memt : 0), et, cs, csvq(cmd) >> procf
++    }
++  }
++  if (newstate != "") {
++    printf "ms %s\n", nowms > newstate
++    printf "cpu" > newstate; for (k = 2; k <= 9; k++) printf " %s", NCPU[k] > newstate; printf "\n" > newstate
++    for (i = 1; i <= NP; i++) printf "p %s %s\n", PIDS[i], PTK[PIDS[i]] > newstate
++    for (i = 1; i <= NT; i++) printf "t %s %s\n", TIDS[i], TTK[TIDS[i]] > newstate
++    close(newstate)
++  }
++}
++'
++
++# 1 回分の /proc の読み取り対象を「種類 パス」の行で書き出す
++pm_proc_list() {  # mode(top|ps) jboss-pid
++    [ -n "${PM_PREV:-}" ] && [ -r "${PM_PREV}" ] && echo "prev ${PM_PREV}"
++    echo "stat /proc/stat"; echo "loadavg /proc/loadavg"; echo "meminfo /proc/meminfo"; echo "passwd /etc/passwd"
++    for _pm_d in /proc/[0-9]*; do
++        [ -r "${_pm_d}/stat" ] || continue
++        echo "pstat ${_pm_d}/stat"; echo "pstatm ${_pm_d}/statm"; echo "pstatus ${_pm_d}/status"; echo "pcmd ${_pm_d}/cmdline"
++    done
++    if [ "$1" = top ] && [ -n "$2" ] && [ "${PERF_TOP_THREADS}" -gt 0 ]; then
++        for _pm_d in /proc/"$2"/task/[0-9]*; do echo "tstat ${_pm_d}/stat"; done
++    fi
++}
++
++# /proc から top 相当の 1 区間分を書く (PM_PREV = 前回の状態)
++pm_proc_top_once() {
++    PM_PREV="${PM_W}/proctop.prev"
++    pm_jboss_alive || PM_JPID="$(pm_find_jboss_pid)" || PM_JPID=""
++    pm_now
++    pm_proc_list top "${PM_JPID}" > "${PM_W}/proctop.list"
++    awk -v mode=top -v ts="${PM_TS}" -v epoch="${PM_EPOCH}" -v nowms="$(pm_ms)" -v hz="${PM_HZ}" -v pagekb="${PM_PAGEKB}" \
++        -v topn="${PERF_TOP_THREADS}" -v sumf="${PM_OUT}/os_top_summary.csv" -v procf="${PM_OUT}/os_top_process.csv" \
++        -v thf="${PM_OUT}/os_top_threads.csv" -v newstate="${PM_W}/proctop.new" \
++        "${pm_role_awk}${PM_PROCTOP_AWK}" "${PM_W}/proctop.list" 2>> "${PM_W}/top.err"
++    mv -f "${PM_W}/proctop.new" "${PM_PREV}" 2>/dev/null
++}
++
++pm_hz_page() {
++    PM_HZ="$(getconf CLK_TCK 2>/dev/null)"; pm_is_uint "${PM_HZ}" || PM_HZ=100
++    PM_PAGEKB=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
++    [ "${PM_PAGEKB}" -gt 0 ] || PM_PAGEKB=4
++}
++
++pm_top_threads_loop() {
++    PM_NAME=top-threads
++    pm_wait_jboss || return 0
++    while :; do
++        pm_jboss_alive || PM_JPID="$(pm_find_jboss_pid)" || { sleep 5; continue; }
++        pm_log INFO "③ top -H (JBoss pid=${PM_JPID} のスレッド別 CPU 上位 ${PERF_TOP_THREADS} 件) を開始します"
++        # shellcheck disable=SC2086
++        ( LC_ALL=C TERM=dumb exec top -b -H -p "${PM_JPID}" -d "${PERF_TOP_INTERVAL}" ${PM_TOP_W} ) 2>> "${PM_W}/top.err" \
++            | awk -v top="${PERF_TOP_THREADS}" -v outf="${PM_OUT}/os_top_threads.csv" "${PM_TOPTH_AWK}"
++        sleep 5
++    done
++}
++
++pm_run_top() {
++    PM_NAME=top
++    trap 'exit 0' TERM INT
++    pm_csv_init "${PM_OUT}/os_top_summary.csv" "${PM_TOP_SUM_H}"
++    pm_csv_init "${PM_OUT}/os_top_process.csv" "${PM_TOP_PROC_H}"
++    [ "${PERF_TOP_THREADS}" -gt 0 ] && pm_csv_init "${PM_OUT}/os_top_threads.csv" "${PM_TOP_TH_H}"
++    if ! command -v top >/dev/null 2>&1; then
++        pm_hz_page
++        pm_meta os top_source "/proc (top がありません)"
++        pm_log INFO "③ top がないため /proc から top 相当の値を ${PERF_TOP_INTERVAL} 秒間隔で算出します"
++        while :; do
++            pm_proc_top_once
++            pm_sleep_tick "${PERF_TOP_INTERVAL}"
++        done
++    fi
++    PM_TOP_W=""
++    if LC_ALL=C top -b -n 1 -w 512 > /dev/null 2>&1; then PM_TOP_W="-w 512"; fi
++    pm_meta os top_source "top ($(top -v 2>&1 | head -n 1 | sed 's/^ *//'))"
++    _pm_raw=""
++    [ "${PERF_TOP_RAW}" = true ] && _pm_raw="${PM_OUT}/os_top.log"
++    if [ "${PERF_TOP_THREADS}" -gt 0 ]; then
++        ( pm_top_threads_loop ) &
++    fi
++    pm_log INFO "③ top: ${PERF_TOP_INTERVAL} 秒間隔"
++    while :; do
++        # shellcheck disable=SC2086
++        ( LC_ALL=C TERM=dumb exec top -b -c -d "${PERF_TOP_INTERVAL}" ${PM_TOP_W} ) 2>> "${PM_W}/top.err" \
++            | awk -v rawf="${_pm_raw}" -v sumf="${PM_OUT}/os_top_summary.csv" -v procf="${PM_OUT}/os_top_process.csv" "${pm_role_awk}${PM_TOP_AWK}"
++        pm_log WARN "③ top が終了しました。5 秒後に再開します (詳細: ${PM_W}/top.err)"
++        sleep 5
++    done
++}
++
++pm_run_ps() {
++    PM_NAME="ps"
++    trap 'exit 0' TERM INT
++    pm_csv_init "${PM_OUT}/os_ps.csv" "${PM_PS_H}"
++    if command -v ps >/dev/null 2>&1; then
++        pm_meta os ps_source "ps"
++        pm_log INFO "③ ps: ${PERF_PS_INTERVAL} 秒間隔"
++        while :; do
++            pm_now
++            LC_ALL=C ps -e -ww -o pid=,ppid=,user=,stat=,nlwp=,rss=,vsz=,pcpu=,pmem=,etimes=,times=,args= 2>> "${PM_W}/ps.err" \
++                | awk -v ts="${PM_TS}" -v epoch="${PM_EPOCH}" "${pm_role_awk}${PM_PS_AWK}" >> "${PM_OUT}/os_ps.csv"
++            pm_sleep_tick "${PERF_PS_INTERVAL}"
++        done
++    fi
++    pm_hz_page
++    pm_meta os ps_source "/proc (ps がありません)"
++    pm_log INFO "③ ps がないため /proc から ps 相当の値を ${PERF_PS_INTERVAL} 秒間隔で算出します"
++    while :; do
++        pm_now
++        PM_PREV=""
++        pm_proc_list ps "" > "${PM_W}/procps.list"
++        _pm_up="$(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
++        awk -v mode=ps -v ts="${PM_TS}" -v epoch="${PM_EPOCH}" -v hz="${PM_HZ}" -v pagekb="${PM_PAGEKB}" -v uptime="${_pm_up}" \
++            -v procf="${PM_OUT}/os_ps.csv" -v newstate="" \
++            "${pm_role_awk}${PM_PROCTOP_AWK}" "${PM_W}/procps.list" 2>> "${PM_W}/ps.err"
++        pm_sleep_tick "${PERF_PS_INTERVAL}"
++    done
++}
++
++# ---- JBoss のスレッド別 (用途ごと) CPU・状態、FD・TCP、④ CPU の待ち ----
++PM_JBOSS_TH_H="timestamp,epoch,pid,group,threads,running,sleeping,disk_wait,other_state,cpu_pct,nonvol_ctxsw_per_sec"
++PM_JBOSS_PROC_H="timestamp,epoch,pid,threads,fd_count,fd_limit,vm_rss_kb,vm_hwm_kb,rss_anon_kb,rss_file_kb,tcp_sockets,tcp_established,tcp_established_in,tcp_established_out,tcp_close_wait,tcp_listen,tcp_other,tcp_time_wait_all,est_out_ports,est_in_ports"
++PM_SCHED_H="timestamp,epoch,cpus,cpu_user_pct,cpu_nice_pct,cpu_system_pct,cpu_iowait_pct,cpu_irq_pct,cpu_softirq_pct,cpu_steal_pct,cpu_idle_pct,procs_running,procs_blocked,load1,load5,load15,ctxt_per_sec,psi_some_avg10,psi_full_avg10,psi_some_ms,cfs_periods,cfs_throttled,cfs_throttled_ms,jboss_cpu_cores,jboss_threads_running,gc_cpu_cores,jit_cpu_cores,app_cpu_cores"
++
++PM_PROC_AWK='
++function pstat(l,    a, b, n, rest) {
++  a = index(l, "("); b = 0
++  for (n = length(l); n > a; n--) if (substr(l, n, 1) == ")") { b = n; break }
++  if (a == 0 || b == 0) return 0
++  COMM = substr(l, a + 1, b - a - 1); rest = substr(l, b + 2)
++  split(rest, F, " ")
++  return 1
++}
++function hex(s,    i, n, c) { n = 0; s = toupper(s); for (i = 1; i <= length(s); i++) { c = index("0123456789ABCDEF", substr(s, i, 1)); if (c == 0) return n; n = n * 16 + c - 1 } return n }
++function grp(n) {
++  if (n ~ /^(GC Thread|G1 |ZWorker|ZDirector|ZDriver|ZUncommit|ZStat|Shenandoah|ParGC|PSPromo|ConcGC)/) return "gc"
++  if (n ~ /^(C1 CompilerThre|C2 CompilerThre|JVMCI)/) return "jit"
++  if (n ~ /^JFR /) return "jfr"
++  if (n ~ /^(VM Thread|VM Periodic|Service Thread|Monitor Deflati|Signal Dispatch|Reference Handl|Finalizer|Common-Cleaner|Notification Th|Attach Listene|Sweeper)/) return "vm"
++  if (n ~ /^(MSC service|ServerService|management|DeploymentScan|Transaction|Periodic Recov|IdleRemover|Reference Reape|Controller Boo|ElytronTimer)/) return "jboss"
++  if (n ~ / I\/O-[0-9]*$/ || n ~ / Accept$/) return "http-io"
++  if (n ~ / task-[0-9]*$/) return "http-task"
++  if (n ~ /^(EE-Managed|EJB default|EJB )/) return "ee-ejb"
++  return "other"
++}
++function line(tag, p, l,    a, k, tid) {
++  if (tag == "prev") { split(l, a, " ")
++    if (a[1] == "ms") PMS = a[2]; else if (a[1] == "cpu") { for (k = 2; k <= 9; k++) PC[k] = a[k] } else if (a[1] == "ctxt") PCT = a[2]
++    else if (a[1] == "psi") PPSI = a[2]; else if (a[1] == "thr") { PNP = a[2]; PNT = a[3]; PTU = a[4] } else if (a[1] == "pt") PPT = a[2]
++    else if (a[1] == "t") { PTT[a[2]] = a[3]; PTV[a[2]] = a[4] }
++    return }
++  if (tag == "stat") { split(l, a, " ")
++    if (a[1] == "cpu") { for (k = 2; k <= 9; k++) NCPU[k] = a[k] } else if (a[1] == "ctxt") NCT = a[2]; else if (a[1] == "procs_running") PRUN = a[2]; else if (a[1] == "procs_blocked") PBLK = a[2]
++    return }
++  if (tag == "loadavg") { split(l, a, " "); L1 = a[1]; L5 = a[2]; L15 = a[3]; return }
++  if (tag == "psi") {
++    if (l ~ /^some /) { if (match(l, /avg10=[0-9.]+/)) PSIS = substr(l, RSTART + 6, RLENGTH - 6); if (match(l, /total=[0-9]+/)) PSIT = substr(l, RSTART + 6, RLENGTH - 6) }
++    if (l ~ /^full /) { if (match(l, /avg10=[0-9.]+/)) PSIF = substr(l, RSTART + 6, RLENGTH - 6) }
++    return }
++  if (tag == "cpustat") { split(l, a, " "); if (a[1] == "nr_periods") NNP = a[2]; else if (a[1] == "nr_throttled") NNT = a[2]; else if (a[1] == "throttled_usec") NTU = a[2]; else if (a[1] == "throttled_time") NTU = int(a[2] / 1000); return }
++  if (tag == "pstat") { if (pstat(l)) PTK = F[12] + F[13]; return }
++  if (tag == "pstatus") { split(l, a, /[: \t]+/)
++    if (a[1] == "Threads") PTHR = a[2]; else if (a[1] == "VmRSS") RSS = a[2]; else if (a[1] == "VmHWM") HWM = a[2]; else if (a[1] == "RssAnon") RANON = a[2]; else if (a[1] == "RssFile") RFILE = a[2]
++    return }
++  if (tag == "limits") { if (l ~ /^Max open files/) { split(l, a, /  +/); FDLIM = a[2] } return }
++  if (tag == "tstat") { if (pstat(l)) { tid = p; sub(/^.*\/task\//, "", tid); sub(/\/.*$/, "", tid); TK[tid] = F[12] + F[13]; TS0[tid] = F[1]; TG[tid] = grp(COMM); TIDS[++NTH] = tid } return }
++  if (tag == "tstatus") { if (l ~ /^nonvoluntary_ctxt_switches:/) { tid = p; sub(/^.*\/task\//, "", tid); sub(/\/.*$/, "", tid); split(l, a, /[: \t]+/); TV[tid] = a[2] } return }
++  if (tag == "fd") { if (l ~ / -> /) NFD++; if (match(l, /socket:\[[0-9]+\]/)) SOCK[substr(l, RSTART + 8, RLENGTH - 9)] = 1; return }
++  if (tag == "tcp") {
++    split(l, a, " "); if (a[1] !~ /^[0-9]+:$/) return
++    st = a[4]
++    if (st == "06") TWALL++
++    if (!(a[10] in SOCK)) return
++    NSOCK++
++    split(a[2], lo, ":"); split(a[3], re, ":"); lp = hex(lo[2]); rp = hex(re[2])
++    if (st == "0A") { LISTEN++; LP[lp] = 1 }
++    else if (st == "01") { NE++; EL[NE] = lp; ER[NE] = rp }
++    else if (st == "08") CLOSEW++
++    else OTHER++
++    return }
++}
++function rd(p, tag,    l) { while ((getline l < p) > 0) line(tag, p, l); close(p) }
++function topports(arr,    n, s, k, i, j, m, t, KK, VV) {
++  n = 0; for (k in arr) { n++; KK[n] = k; VV[n] = arr[k] }
++  s = ""
++  for (i = 1; i <= n && i <= 5; i++) { m = i; for (j = i + 1; j <= n; j++) if (VV[j] > VV[m]) m = j; t = KK[i]; KK[i] = KK[m]; KK[m] = t; t = VV[i]; VV[i] = VV[m]; VV[m] = t; if (s != "") s = s " "; s = s KK[i] ":" VV[i] }
++  return s
++}
++{ tag = $1; p = substr($0, length($1) + 2); rd(p, tag) }
++END {
++  el = (PMS != "") ? (nowms - PMS) / 1000.0 : 0
++  # ---- JBoss のスレッドを用途別に ----
++  if (jpid != "") {
++    for (i = 1; i <= NTH; i++) {
++      t = TIDS[i]; g = TG[t]
++      for (k = 0; k < 2; k++) { gg = (k == 0) ? "all" : g
++        if (!(gg in GN)) GO[++NG] = gg
++        GN[gg]++; s = TS0[t]
++        if (s == "R") GR[gg]++; else if (s == "S" || s == "I") GS[gg]++; else if (s == "D") GD[gg]++; else GX[gg]++
++        if (el > 0 && (t in PTT)) { dt = TK[t] - PTT[t]; if (dt > 0) GT[gg] += dt; dv = TV[t] - PTV[t]; if (dv > 0) GV[gg] += dv }
++      }
++    }
++    for (i = 1; i <= NG; i++) { gg = GO[i]
++      printf "%s,%s,%s,%s,%d,%d,%d,%d,%d,%s,%s\n", ts, epoch, jpid, gg, GN[gg], GR[gg], GS[gg], GD[gg], GX[gg], \
++        (el > 0 ? sprintf("%.1f", GT[gg] * 100.0 / (el * hz)) : ""), (el > 0 ? sprintf("%.1f", GV[gg] / el) : "") >> thf }
++    # ---- FD・TCP (JBoss が持っているソケットだけを数える。TIME_WAIT は持ち主が無いのでタスク全体) ----
++    for (i = 1; i <= NE; i++) { if (EL[i] in LP) { NIN++; IN[EL[i]]++ } else { NOUT++; OUTP[ER[i]]++ } }
++    printf "%s,%s,%s,%s,%d,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s\n", ts, epoch, jpid, PTHR, NFD, FDLIM, RSS, HWM, RANON, RFILE, NSOCK, NE, NIN, NOUT, CLOSEW, LISTEN, OTHER, TWALL, \
++      topports(OUTP), topports(IN) >> procf
++  }
++  # ---- ④ CPU の待ち・steal・スロットリング ----
++  tot = 0; for (k = 2; k <= 9; k++) { d[k] = NCPU[k] - PC[k]; tot += d[k] }
++  if (el > 0 && tot > 0) {
++    app = GT["http-task"] + GT["http-io"] + GT["ee-ejb"] + GT["other"]
++    printf "%s,%s,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%s,%s,%s,%s,%.0f,%s,%s,%s,%s,%s,%s,%s,%d,%s,%s,%s\n", ts, epoch, cpus, \
++      d[2] * 100 / tot, d[3] * 100 / tot, d[4] * 100 / tot, d[6] * 100 / tot, d[7] * 100 / tot, d[8] * 100 / tot, d[9] * 100 / tot, d[5] * 100 / tot, \
++      PRUN, PBLK, L1, L5, L15, (NCT - PCT) / el, PSIS, PSIF, (PSIT != "" && PPSI != "" ? sprintf("%.1f", (PSIT - PPSI) / 1000.0) : ""), \
++      (NNP != "" && PNP != "" ? NNP - PNP : ""), (NNT != "" && PNT != "" ? NNT - PNT : ""), (NTU != "" && PTU != "" ? sprintf("%.1f", (NTU - PTU) / 1000.0) : ""), \
++      (jpid != "" && PPT != "" ? sprintf("%.3f", (PTK - PPT) / hz / el) : ""), GR["all"], \
++      (jpid != "" ? sprintf("%.3f", GT["gc"] / hz / el) : ""), (jpid != "" ? sprintf("%.3f", GT["jit"] / hz / el) : ""), (jpid != "" ? sprintf("%.3f", app / hz / el) : "") >> schedf
++  }
++  printf "ms %s\n", nowms > newstate
++  printf "cpu" > newstate; for (k = 2; k <= 9; k++) printf " %s", NCPU[k] > newstate; printf "\n" > newstate
++  printf "ctxt %s\n", NCT > newstate
++  if (PSIT != "") printf "psi %s\n", PSIT > newstate
++  if (NNP != "") printf "thr %s %s %s\n", NNP, NNT, NTU > newstate
++  if (jpid != "") { printf "pt %s\n", PTK > newstate; for (i = 1; i <= NTH; i++) printf "t %s %s %s\n", TIDS[i], TK[TIDS[i]], TV[TIDS[i]] + 0 > newstate }
++  close(newstate)
++}
++'
++
++pm_run_proc() {
++    PM_NAME=proc
++    trap 'exit 0' TERM INT
++    pm_hz_page
++    pm_csv_init "${PM_OUT}/os_jboss_threads.csv" "${PM_JBOSS_TH_H}"
++    pm_csv_init "${PM_OUT}/os_jboss_proc.csv" "${PM_JBOSS_PROC_H}"
++    pm_csv_init "${PM_OUT}/cpu_sched.csv" "${PM_SCHED_H}"
++    _pm_cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null)"
++    # cgroup の CPU 統計 (スロットリング) と PSI (CPU の待ち) の場所
++    _pm_cst=""; _pm_psi=""
++    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
++        [ -r /sys/fs/cgroup/cpu.stat ] && _pm_cst=/sys/fs/cgroup/cpu.stat
++        [ -r /sys/fs/cgroup/cpu.pressure ] && _pm_psi=/sys/fs/cgroup/cpu.pressure
++    else
++        for _pm_g in /sys/fs/cgroup/cpu /sys/fs/cgroup/cpu,cpuacct /sys/fs/cgroup/cpuacct,cpu; do
++            [ -r "${_pm_g}/cpu.stat" ] && { _pm_cst="${_pm_g}/cpu.stat"; break; }
++        done
++    fi
++    [ -z "${_pm_psi}" ] && [ -r /proc/pressure/cpu ] && _pm_psi=/proc/pressure/cpu
++    pm_meta os proc_sources "cpu.stat=${_pm_cst:-なし} pressure=${_pm_psi:-なし}"
++    pm_log INFO "③④ /proc: ${PERF_PROC_INTERVAL} 秒間隔 (JBoss のスレッド別 CPU・FD・TCP、CPU の待ち)"
++    PM_JPID=""
++    while :; do
++        pm_jboss_alive || PM_JPID="$(pm_find_jboss_pid)" || PM_JPID=""
++        pm_now
++        _pm_nowms="$(pm_ms)"
++        {
++            [ -r "${PM_W}/proc.prev" ] && echo "prev ${PM_W}/proc.prev"
++            echo "stat /proc/stat"; echo "loadavg /proc/loadavg"
++            [ -n "${_pm_psi}" ] && echo "psi ${_pm_psi}"
++            [ -n "${_pm_cst}" ] && echo "cpustat ${_pm_cst}"
++            if [ -n "${PM_JPID}" ]; then
++                echo "pstat /proc/${PM_JPID}/stat"; echo "pstatus /proc/${PM_JPID}/status"; echo "limits /proc/${PM_JPID}/limits"
++                for _pm_t in /proc/"${PM_JPID}"/task/[0-9]*; do echo "tstat ${_pm_t}/stat"; echo "tstatus ${_pm_t}/status"; done
++                ls -l "/proc/${PM_JPID}/fd" > "${PM_W}/proc.fd" 2>/dev/null
++                echo "fd ${PM_W}/proc.fd"
++                echo "tcp /proc/net/tcp"; echo "tcp /proc/net/tcp6"
++            fi
++        } > "${PM_W}/proc.list"
++        awk -v ts="${PM_TS}" -v epoch="${PM_EPOCH}" -v nowms="${_pm_nowms}" -v hz="${PM_HZ}" -v cpus="${_pm_cpus}" -v jpid="${PM_JPID}" \
++            -v thf="${PM_OUT}/os_jboss_threads.csv" -v procf="${PM_OUT}/os_jboss_proc.csv" -v schedf="${PM_OUT}/cpu_sched.csv" \
++            -v newstate="${PM_W}/proc.new" "${PM_PROC_AWK}" "${PM_W}/proc.list" 2>> "${PM_W}/proc.err"
++        mv -f "${PM_W}/proc.new" "${PM_W}/proc.prev" 2>/dev/null
++        pm_sleep_tick "${PERF_PROC_INTERVAL}"
++    done
++}
++
++# =============================================================================
++# JFR → CSV (perf-metrics.sh jfr-csv)
++# =============================================================================
++# 単一ファイルの Java (java PerfJfrCsv.java) で、公開 API (jdk.jfr.consumer) だけを使って読む。
++# Red Hat の OpenJDK 21 runtime イメージにも jdk.jfr・jdk.compiler モジュールが入っている。
++# 同じものが出力先の jfr/PerfJfrCsv.java にも置かれ、PC (JDK 17 以降) でも変換できる。
++PM_JFR_JAVA='// perf-metrics.sh: JFR (Flight Recorder) recordings -> CSV files for the Excel report.
++// Usage: java PerfJfrCsv.java <out-dir> <interval-seconds> <jfr dir or file> [...]
++// Needs only the public jdk.jfr.consumer API (JDK 11+; tested with Red Hat OpenJDK 21 and JDK 17).
++// Runs as a single-file source program, so it has no package and only one top-level public class.
++import java.io.*;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.*;
++import java.time.*;
++import java.time.format.DateTimeFormatter;
++import java.util.*;
++import java.util.regex.*;
++import jdk.jfr.consumer.*;
++
++public class PerfJfrCsv {
++    static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
++    static final ZoneId ZONE = ZoneId.systemDefault();
++    static final Pattern MASK = Pattern.compile("(?i)([A-Za-z0-9_.-]*(password|passwd|secret)[A-Za-z0-9_.-]*[=:])[^ ,]*");
++    static final Pattern REPO_DIR = Pattern.compile("^\\d{4}_\\d{2}_\\d{2}_\\d{2}_\\d{2}_\\d{2}_(\\d+)$");
++    static final Pattern DUMP_FILE = Pattern.compile("^perf_(\\d+)_.*\\.jfr$");
++
++    static long interval = 10;
++    static final TreeMap<Long, Map<String, Double>> STATS = new TreeMap<>();
++    static final Map<Long, double[]> GC_HEAP = new HashMap<>();          // gcId -> before, after, committed (bytes)
++    static final List<Object[]> GC_EVENTS = new ArrayList<>();          // epoch, gcId, name, cause, sum, longest, duration
++    static final Map<String, Long> HOT = new HashMap<>();
++    static long hotTotal = 0;
++    static final Map<String, double[]> CONT = new HashMap<>();          // count, total ms, max ms
++    static final Map<String, double[]> IO = new HashMap<>();            // count, total ms, max ms, bytes
++    static final Map<String, double[]> VMOPS = new HashMap<>();         // count, total ms, max ms
++    static final Map<String, long[]> TYPES = new TreeMap<>();           // count, first epoch, last epoch
++    static final LinkedHashMap<String, String> ENV = new LinkedHashMap<>();
++    static final List<String[]> FILES = new ArrayList<>();
++
++    public static void main(String[] args) throws Exception {
++        if (args.length < 3) {
++            System.err.println("usage: java PerfJfrCsv.java <out-dir> <interval-seconds> <jfr dir or file> [...]");
++            System.exit(2);
++        }
++        Path out = Paths.get(args[0]);
++        Files.createDirectories(out);
++        try { interval = Math.max(1, Long.parseLong(args[1])); } catch (NumberFormatException e) { interval = 10; }
++        List<Path> files = pick(Arrays.copyOfRange(args, 2, args.length));
++        if (files.isEmpty()) {
++            System.err.println("no .jfr files found");
++            System.exit(1);
++        }
++        for (Path f : files) read(f);
++        writeAll(out);
++        System.out.println("files=" + files.size() + " events=" + TYPES.values().stream().mapToLong(v -> v[0]).sum() + " out=" + out);
++    }
++
++    // Select the recordings to read. For each JVM (pid) use the dump written at exit when it
++    // exists (it already contains every chunk), otherwise the chunks left in the repository
++    // (JVM killed before it could dump). Dumps under a "dump" directory (taken on demand) are
++    // copies of the same data, so they are only used when nothing else is available.
++    static List<Path> pick(String[] roots) throws IOException {
++        Map<String, List<Path>> dumps = new TreeMap<>(), chunks = new TreeMap<>();
++        List<Path> others = new ArrayList<>(), ondemand = new ArrayList<>();
++        for (String r : roots) {
++            Path p = Paths.get(r);
++            if (!Files.exists(p)) continue;
++            List<Path> all = new ArrayList<>();
++            if (Files.isDirectory(p)) {
++                try (java.util.stream.Stream<Path> s = Files.walk(p)) {
++                    s.filter(x -> Files.isRegularFile(x) && x.getFileName().toString().endsWith(".jfr")).forEach(all::add);
++                }
++            } else all.add(p);
++            for (Path f : all) {
++                String name = f.getFileName().toString();
++                Path parent = f.getParent();
++                String pname = parent == null || parent.getFileName() == null ? "" : parent.getFileName().toString();
++                Matcher m = DUMP_FILE.matcher(name), r2 = REPO_DIR.matcher(pname);
++                if (pname.equals("dump")) ondemand.add(f);
++                else if (m.matches()) dumps.computeIfAbsent(m.group(1), k -> new ArrayList<>()).add(f);
++                else if (r2.matches()) chunks.computeIfAbsent(r2.group(1), k -> new ArrayList<>()).add(f);
++                else others.add(f);
++            }
++        }
++        List<Path> sel = new ArrayList<>();
++        Set<String> pids = new TreeSet<>(dumps.keySet());
++        pids.addAll(chunks.keySet());
++        for (String pid : pids) {
++            List<Path> l = dumps.containsKey(pid) ? dumps.get(pid) : chunks.get(pid);
++            Collections.sort(l);
++            sel.addAll(l);
++        }
++        Collections.sort(others);
++        sel.addAll(others);
++        if (sel.isEmpty()) { Collections.sort(ondemand); sel.addAll(ondemand); }
++        return sel;
++    }
++
++    static void read(Path f) {
++        long n = 0;
++        String status = "ok";
++        try (RecordingFile rf = new RecordingFile(f)) {
++            while (rf.hasMoreEvents()) {
++                RecordedEvent e;
++                try { e = rf.readEvent(); } catch (EOFException eof) { status = "truncated"; break; }
++                n++;
++                try { handle(e); } catch (RuntimeException ex) { /* one bad event must not stop the rest */ }
++            }
++        } catch (Throwable t) {
++            status = (n > 0 ? "partial: " : "error: ") + t.getClass().getSimpleName() + " " + String.valueOf(t.getMessage());
++        }
++        FILES.add(new String[] { f.toString(), String.valueOf(fsize(f)), String.valueOf(n), status });
++    }
++
++    static long fsize(Path f) { try { return Files.size(f); } catch (IOException e) { return -1; } }
++
++    static void handle(RecordedEvent e) {
++        String type = e.getEventType().getName();
++        long ep = e.getStartTime().getEpochSecond();
++        long[] t = TYPES.computeIfAbsent(type, k -> new long[] { 0, Long.MAX_VALUE, Long.MIN_VALUE });
++        t[0]++; t[1] = Math.min(t[1], ep); t[2] = Math.max(t[2], ep);
++        switch (type) {
++            case "jdk.CPULoad":
++                put(ep, "jvm_user_pct", pct(e, "jvmUser")); put(ep, "jvm_system_pct", pct(e, "jvmSystem")); put(ep, "machine_total_pct", pct(e, "machineTotal"));
++                break;
++            case "jdk.JavaThreadStatistics":
++                put(ep, "threads_active", num(e, "activeCount")); put(ep, "threads_daemon", num(e, "daemonCount"));
++                put(ep, "threads_peak", num(e, "peakCount")); put(ep, "threads_accumulated", num(e, "accumulatedCount"));
++                break;
++            case "jdk.ClassLoadingStatistics":
++                put(ep, "classes_loaded", num(e, "loadedClassCount")); put(ep, "classes_unloaded", num(e, "unloadedClassCount"));
++                break;
++            case "jdk.CompilerStatistics":
++                put(ep, "compiles", num(e, "compileCount")); put(ep, "osr_compiles", num(e, "osrCompileCount"));
++                put(ep, "bailouts", num(e, "bailoutCount")); put(ep, "invalidated", num(e, "invalidatedCount"));
++                put(ep, "compile_time_ms", ms(e, "totalTimeSpent")); put(ep, "nmethod_code_mb", mb(e, "nmethodCodeSize"));
++                break;
++            case "jdk.CodeCacheStatistics": {
++                // one event per code heap segment; summed per interval when written
++                String bt = str(e, "codeBlobType");
++                put(ep, "cc_free." + bt, mb(e, "unallocatedCapacity")); put(ep, "cc_full." + bt, num(e, "fullCount"));
++                break;
++            }
++            case "jdk.ExceptionStatistics":
++                put(ep, "throwables", num(e, "throwables"));
++                break;
++            case "jdk.ThreadContextSwitchRate":
++                put(ep, "ctx_switch_per_sec", num(e, "switchRate"));
++                break;
++            case "jdk.ResidentSetSize":
++                put(ep, "rss_mb", mb(e, "size")); put(ep, "rss_peak_mb", mb(e, "peak"));
++                break;
++            case "jdk.DirectBufferStatistics":
++                put(ep, "direct_buffer_count", num(e, "count")); put(ep, "direct_buffer_used_mb", mb(e, "memoryUsed"));
++                break;
++            case "jdk.NativeMemoryUsageTotal":
++                put(ep, "nmt_reserved_mb", mb(e, "reserved")); put(ep, "nmt_committed_mb", mb(e, "committed"));
++                break;
++            case "jdk.ContainerCPUThrottling":
++                put(ep, "throttled_slices", num(e, "cpuThrottledSlices")); put(ep, "elapsed_slices", num(e, "cpuElapsedSlices"));
++                put(ep, "throttled_ms", ms(e, "cpuThrottledTime"));
++                break;
++            case "jdk.GarbageCollection":
++                GC_EVENTS.add(new Object[] { e.getStartTime(), num(e, "gcId"), str(e, "name"), str(e, "cause"),
++                        ms(e, "sumOfPauses"), ms(e, "longestPause"), (double) e.getDuration().toNanos() / 1e6 });
++                break;
++            case "jdk.GCHeapSummary": {
++                Double id = num(e, "gcId");
++                if (id == null) break;
++                double[] h = GC_HEAP.computeIfAbsent(id.longValue(), k -> new double[] { Double.NaN, Double.NaN, Double.NaN });
++                Double used = num(e, "heapUsed");
++                String when = str(e, "when");
++                if (used != null && when != null) { if (when.startsWith("Before")) h[0] = used; else h[1] = used; }
++                Object hs = val(e, "heapSpace");
++                if (hs instanceof RecordedObject && ((RecordedObject) hs).hasField("committedSize")) h[2] = ((RecordedObject) hs).getLong("committedSize");
++                break;
++            }
++            case "jdk.ExecutionSample": {
++                RecordedStackTrace st = e.getStackTrace();
++                if (st == null || st.getFrames().isEmpty()) break;
++                String m = method(st.getFrames().get(0));
++                HOT.merge(m, 1L, Long::sum);
++                hotTotal++;
++                break;
++            }
++            case "jdk.JavaMonitorEnter": agg(CONT, "monitor-enter\t" + cls(e, "monitorClass") + "\t" + site(e), e, -1); break;
++            case "jdk.ThreadPark": {
++                // idle pool threads waiting for work and periodic timers are not contention
++                String s = site(e);
++                if (!idle(e, s)) agg(CONT, "thread-park\t" + cls(e, "parkedClass") + "\t" + s, e, -1);
++                break;
++            }
++            case "jdk.SocketRead": agg(IO, "socket-read\t" + hostPort(e), e, numOr(e, "bytesRead")); break;
++            case "jdk.SocketWrite": agg(IO, "socket-write\t" + hostPort(e), e, numOr(e, "bytesWritten")); break;
++            case "jdk.FileRead": agg(IO, "file-read\t" + str(e, "path"), e, numOr(e, "bytesRead")); break;
++            case "jdk.FileWrite": agg(IO, "file-write\t" + str(e, "path"), e, numOr(e, "bytesWritten")); break;
++            case "jdk.ExecuteVMOperation": agg(VMOPS, "vm-operation\t" + str(e, "operation") + (bool(e, "safepoint") ? " (safepoint)" : ""), e, -1); break;
++            case "jdk.SafepointBegin": agg(VMOPS, "safepoint\tsafepoint", e, -1); break;
++            case "jdk.ContainerConfiguration":
++                for (String k : new String[] { "containerType", "cpuSlicePeriod", "cpuQuota", "cpuShares", "effectiveCpuCount",
++                        "memorySoftLimit", "memoryLimit", "swapMemoryLimit", "hostTotalMemory", "hostTotalSwapMemory" })
++                    env("container", k, e, k);
++                break;
++            case "jdk.CPUInformation":
++                env("cpu", "cpu", e, "cpu"); env("cpu", "sockets", e, "sockets"); env("cpu", "cores", e, "cores"); env("cpu", "hwThreads", e, "hwThreads");
++                break;
++            case "jdk.GCConfiguration":
++                for (String k : new String[] { "youngCollector", "oldCollector", "parallelGCThreads", "concurrentGCThreads", "usesDynamicGCThreads", "pauseTarget", "gcTimeRatio" })
++                    env("gc", k, e, k);
++                break;
++            case "jdk.GCHeapConfiguration":
++                for (String k : new String[] { "minSize", "maxSize", "initialSize", "usesCompressedOops", "heapAddressBits", "objectAlignment" }) env("heap", k, e, k);
++                break;
++            case "jdk.CompilerConfiguration":
++                env("compiler", "threadCount", e, "threadCount"); env("compiler", "tieredCompilation", e, "tieredCompilation");
++                break;
++            case "jdk.JVMInformation":
++                env("jvm", "jvmName", e, "jvmName"); env("jvm", "jvmVersion", e, "jvmVersion"); env("jvm", "pid", e, "pid");
++                env("jvm", "jvmStartTime", e, "jvmStartTime"); env("jvm", "jvmFlags", e, "jvmFlags"); env("jvm", "jvmArguments", e, "jvmArguments");
++                break;
++            case "jdk.OSInformation": env("os", "osVersion", e, "osVersion"); break;
++            case "jdk.VirtualizationInformation": env("os", "virtualization", e, "name"); break;
++            case "jdk.PhysicalMemory": env("os", "totalSize", e, "totalSize"); break;
++            default: break;
++        }
++    }
++
++    // ---- value helpers (a missing field returns null, so one JDK version difference does not break the rest)
++    static Object val(RecordedObject e, String f) { return e.hasField(f) ? e.getValue(f) : null; }
++    static Double num(RecordedObject e, String f) {
++        Object v = val(e, f);
++        if (v instanceof Number) return ((Number) v).doubleValue();
++        if (v instanceof Boolean) return ((Boolean) v) ? 1.0 : 0.0;
++        return null;
++    }
++    static double numOr(RecordedObject e, String f) { Double d = num(e, f); return d == null ? -1 : d; }
++    static Double pct(RecordedObject e, String f) { Double d = num(e, f); return d == null ? null : d * 100.0; }
++    static Double mb(RecordedObject e, String f) { Double d = num(e, f); return d == null ? null : d / 1048576.0; }
++    // @Timespan fields: getValue returns the raw number, getDuration converts it with its unit
++    static Double ms(RecordedObject e, String f) {
++        if (!e.hasField(f)) return null;
++        try {
++            Duration d = e.getDuration(f);
++            if (d.getSeconds() == Long.MIN_VALUE || d.getSeconds() == Long.MAX_VALUE) return null;
++            return d.toNanos() / 1e6;
++        } catch (RuntimeException ex) { return null; }
++    }
++    static boolean bool(RecordedObject e, String f) { Object v = val(e, f); return v instanceof Boolean && (Boolean) v; }
++    static String str(RecordedObject e, String f) { Object v = val(e, f); return v == null ? null : String.valueOf(v); }
++    static String cls(RecordedEvent e, String f) {
++        Object v = val(e, f);
++        if (v instanceof RecordedClass) return ((RecordedClass) v).getName();
++        return v == null ? "" : String.valueOf(v);
++    }
++    static String hostPort(RecordedEvent e) {
++        String h = str(e, "host");
++        if (h == null || h.isEmpty()) h = str(e, "address");
++        Double p = num(e, "port");
++        return (h == null ? "" : h) + ":" + (p == null ? "" : String.valueOf(p.longValue()));
++    }
++    static String method(RecordedFrame fr) {
++        RecordedMethod m = fr.getMethod();
++        if (m == null) return "(unknown)";
++        RecordedClass c = m.getType();
++        return (c == null ? "" : c.getName() + ".") + m.getName();
++    }
++    // The first frame that is not in the JDK itself (where the application or JBoss waited).
++    static String site(RecordedEvent e) {
++        RecordedStackTrace st = e.getStackTrace();
++        if (st == null || st.getFrames().isEmpty()) return "";
++        String first = null;
++        for (RecordedFrame fr : st.getFrames()) {
++            String m = method(fr);
++            if (first == null) first = m;
++            if (!(m.startsWith("java.") || m.startsWith("jdk.") || m.startsWith("sun.") || m.startsWith("javax."))) return m;
++        }
++        return first;
++    }
++    static final String[] IDLE_FRAMES = { "java.util.concurrent.ThreadPoolExecutor.getTask", "java.util.concurrent.ScheduledThreadPoolExecutor$DelayedWorkQueue.take",
++            "java.util.concurrent.ForkJoinPool.awaitWork", "java.util.concurrent.LinkedBlockingQueue.take", "java.util.concurrent.SynchronousQueue",
++            "java.util.concurrent.DelayQueue.take", "java.lang.ref.ReferenceQueue.remove" };
++    static final String[] IDLE_SITES = { "org.jboss.threads.EnhancedQueueExecutor$ThreadBody.run", "org.jboss.threads.JBossThread.run",
++            "jdk.internal.misc.Unsafe.park", "java.lang.Thread.run", "org.jboss.jca.core.connectionmanager.pool.idle.IdleRemover",
++            "com.arjuna.ats.internal.arjuna.recovery.PeriodicRecovery", "com.arjuna.ats.internal.arjuna.coordinator.ReaperThread" };
++    static boolean idle(RecordedEvent e, String site) {
++        if (site != null) for (String p : IDLE_SITES) if (site.startsWith(p)) return true;
++        RecordedStackTrace st = e.getStackTrace();
++        if (st != null) for (RecordedFrame fr : st.getFrames()) { String m = method(fr); for (String p : IDLE_FRAMES) if (m.startsWith(p)) return true; }
++        return false;
++    }
++    static void put(long ep, String k, Double v) {
++        if (v == null || v.isNaN()) return;
++        STATS.computeIfAbsent(ep - Math.floorMod(ep, interval), x -> new HashMap<>()).put(k, v);
++    }
++    static void agg(Map<String, double[]> m, String key, RecordedEvent e, double bytes) {
++        double d = e.getDuration().toNanos() / 1e6;
++        double[] a = m.computeIfAbsent(key, k -> new double[] { 0, 0, 0, 0 });
++        a[0]++; a[1] += d; a[2] = Math.max(a[2], d);
++        if (bytes > 0) a[3] += bytes;
++    }
++    static void env(String cat, String key, RecordedEvent e, String f) {
++        Object v = val(e, f);
++        if (v == null) return;
++        if (v instanceof Number && (((Number) v).longValue() == Long.MIN_VALUE || ((Number) v).longValue() == Long.MAX_VALUE)) return;
++        String s = String.valueOf(v);
++        if (f.equals("jvmStartTime")) { try { s = ts(e.getInstant(f).getEpochSecond()); } catch (RuntimeException ex) { /* keep the raw value */ } }
++        if (f.equals("jvmArguments") || f.equals("jvmFlags")) s = MASK.matcher(s).replaceAll("$1********");
++        ENV.put(cat + "\t" + key, s);
++    }
++
++    // ---- output
++    static String q(String s) {
++        if (s == null) return "";
++        if (s.contains(",") || s.contains("\"") || s.contains("\n") || s.contains("\r")) return "\"" + s.replace("\"", "\"\"") + "\"";
++        return s;
++    }
++    static String n(Double d) {
++        if (d == null || d.isNaN() || d.isInfinite()) return "";
++        if (d == Math.rint(d) && Math.abs(d) < 1e15) return String.valueOf(d.longValue());
++        return String.format(Locale.ROOT, "%.3f", d);
++    }
++    static String ts(long ep) { return TS.format(Instant.ofEpochSecond(ep).atZone(ZONE)); }
++    static PrintWriter open(Path dir, String name) throws IOException {
++        return new PrintWriter(new BufferedWriter(new OutputStreamWriter(Files.newOutputStream(dir.resolve(name)), StandardCharsets.UTF_8)));
++    }
++    static void line(PrintWriter w, String s) { w.print(s); w.print("\n"); }
++
++    static void writeAll(Path dir) throws IOException {
++        String[] sc = { "jvm_user_pct", "jvm_system_pct", "machine_total_pct", "threads_active", "threads_daemon", "threads_peak", "threads_accumulated",
++                "classes_loaded", "classes_unloaded", "compiles", "osr_compiles", "bailouts", "invalidated", "compile_time_ms", "nmethod_code_mb",
++                "code_cache_free_mb", "code_cache_full_count", "throwables", "ctx_switch_per_sec", "rss_mb", "rss_peak_mb",
++                "direct_buffer_count", "direct_buffer_used_mb", "nmt_reserved_mb", "nmt_committed_mb", "throttled_slices", "elapsed_slices", "throttled_ms" };
++        try (PrintWriter w = open(dir, "jfr_stats.csv")) {
++            line(w, "timestamp,epoch," + String.join(",", sc));
++            for (Map.Entry<Long, Map<String, Double>> en : STATS.entrySet()) {
++                Map<String, Double> v = en.getValue();
++                Double free = null, full = null;
++                for (Map.Entry<String, Double> x : v.entrySet()) {
++                    if (x.getKey().startsWith("cc_free.")) free = (free == null ? 0 : free) + x.getValue();
++                    else if (x.getKey().startsWith("cc_full.")) full = (full == null ? 0 : full) + x.getValue();
++                }
++                if (free != null) v.put("code_cache_free_mb", free);
++                if (full != null) v.put("code_cache_full_count", full);
++                StringBuilder b = new StringBuilder(ts(en.getKey())).append(",").append(en.getKey());
++                for (String k : sc) b.append(",").append(n(v.get(k)));
++                line(w, b.toString());
++            }
++        }
++        GC_EVENTS.sort(Comparator.comparing(o -> (Instant) o[0]));
++        try (PrintWriter w = open(dir, "jfr_gc.csv")) {
++            line(w, "timestamp,epoch,epoch_ms,gc_id,name,cause,sum_of_pauses_ms,longest_pause_ms,duration_ms,heap_before_mb,heap_after_mb,heap_committed_mb");
++            for (Object[] g : GC_EVENTS) {
++                Instant at = (Instant) g[0];
++                Double id = (Double) g[1];
++                double[] h = id == null ? null : GC_HEAP.get(id.longValue());
++                line(w, ts(at.getEpochSecond()) + "," + at.getEpochSecond() + "," + at.toEpochMilli() + "," + n(id) + "," + q((String) g[2]) + "," + q((String) g[3])
++                        + "," + n((Double) g[4]) + "," + n((Double) g[5]) + "," + n((Double) g[6])
++                        + "," + (h == null ? "," + "," : n(h[0] / 1048576.0) + "," + n(h[1] / 1048576.0) + "," + n(h[2] / 1048576.0)));
++            }
++        }
++        try (PrintWriter w = open(dir, "jfr_hot_methods.csv")) {
++            line(w, "rank,method,samples,pct");
++            List<Map.Entry<String, Long>> l = new ArrayList<>(HOT.entrySet());
++            l.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
++            int r = 0;
++            for (Map.Entry<String, Long> en : l) {
++                if (++r > 50) break;
++                line(w, r + "," + q(en.getKey()) + "," + en.getValue() + "," + n(hotTotal == 0 ? null : 100.0 * en.getValue() / hotTotal));
++            }
++        }
++        writeAgg(dir, "jfr_contention.csv", "rank,kind,class,site,count,total_ms,max_ms", CONT, 3, false);
++        writeAgg(dir, "jfr_io.csv", "rank,kind,target,count,total_ms,max_ms,bytes", IO, 2, true);
++        writeAgg(dir, "jfr_vm_operations.csv", "rank,kind,operation,count,total_ms,max_ms", VMOPS, 2, false);
++        try (PrintWriter w = open(dir, "jfr_env.csv")) {
++            line(w, "category,key,value");
++            for (Map.Entry<String, String> en : ENV.entrySet()) {
++                String[] k = en.getKey().split("\t", 2);
++                line(w, q(k[0]) + "," + q(k[1]) + "," + q(en.getValue()));
++            }
++        }
++        try (PrintWriter w = open(dir, "jfr_summary.csv")) {
++            line(w, "kind,name,count,first,last,detail");
++            for (String[] f : FILES) line(w, "file," + q(f[0]) + "," + f[2] + ",,," + q("bytes=" + f[1] + " " + f[3]));
++            for (Map.Entry<String, long[]> en : TYPES.entrySet())
++                line(w, "event," + q(en.getKey()) + "," + en.getValue()[0] + "," + ts(en.getValue()[1]) + "," + ts(en.getValue()[2]) + ",");
++        }
++    }
++
++    static void writeAgg(Path dir, String name, String header, Map<String, double[]> m, int keyCols, boolean withBytes) throws IOException {
++        try (PrintWriter w = open(dir, name)) {
++            line(w, header);
++            List<Map.Entry<String, double[]>> l = new ArrayList<>(m.entrySet());
++            l.sort((a, b) -> Double.compare(b.getValue()[1], a.getValue()[1]));
++            int r = 0;
++            for (Map.Entry<String, double[]> en : l) {
++                if (++r > 100) break;
++                String[] k = en.getKey().split("\t", -1);
++                StringBuilder b = new StringBuilder().append(r);
++                for (int i = 0; i < keyCols; i++) b.append(",").append(q(i < k.length ? k[i] : ""));
++                double[] a = en.getValue();
++                b.append(",").append(n(a[0])).append(",").append(n(a[1])).append(",").append(n(a[2]));
++                if (withBytes) b.append(",").append(a[3] > 0 ? n(a[3]) : "");
++                line(w, b.toString());
++            }
++        }
++    }
++}'
++
++pm_jfr_csv() {
++    _pm_dir="${1:-${PM_JFR_DIR:-${PM_OUT}/jfr}}"
++    _pm_cnt="$(find "${_pm_dir}" -name '*.jfr' -type f 2>/dev/null | wc -l | tr -d ' ')"
++    if [ "${_pm_cnt:-0}" = 0 ]; then
++        echo "JFR のファイルがありません (${_pm_dir})。JBoss の終了時に perf_<pid>_<日時>.jfr が書かれ、記録中は repo/ にチャンクがあります (jfr-dump でも作れます)"
++        return 1
++    fi
++    PM_JPID="$(pm_find_jboss_pid)" || PM_JPID=""
++    _pm_java="$(pm_java_of_jboss)" || { echo "java が見つかりません"; return 1; }
++    _pm_src="${PM_W:-/tmp}/PerfJfrCsv.java"
++    printf '%s\n' "${PM_JFR_JAVA}" > "${_pm_src}" || { echo "${_pm_src} に書けません"; return 1; }
++    echo "JFR を CSV に変換しています (${_pm_cnt} ファイル、${_pm_dir} → ${PM_OUT})..."
++    # 収集中の CPU を奪わないよう優先度を下げる (性能試験の後に実行することを推奨)
++    _pm_nice=""
++    command -v nice >/dev/null 2>&1 && _pm_nice="nice -n 19"
++    # shellcheck disable=SC2086
++    ( unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS
++      exec ${_pm_nice} "${_pm_java}" -Dperf.metrics.collector=jfr-csv -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xmx512m -XX:-UsePerfData \
++          "${_pm_src}" "${PM_OUT}" "${PERF_JFR_INTERVAL}" "${_pm_dir}" ) 2>&1
++}
++
++# =============================================================================
++# ビルド時の確認 / 運用コマンド
++# =============================================================================
++pm_install() {
++    pm_say "ビルド時の確認 (perf-metrics.sh ${PERF_METRICS_VERSION})"
++    _pm_need=""
++    { command -v ps > /dev/null 2>&1 && command -v top > /dev/null 2>&1; } || _pm_need="procps-ng"
++    command -v awk > /dev/null 2>&1 || _pm_need="${_pm_need} gawk"
++    if [ -n "${_pm_need}" ]; then
++        case "${PERF_PROCPS}" in
++            false)
++                pm_say "  ${_pm_need} は入れません (PERF_PROCPS=false)。③ は /proc から同じ項目を算出します" ;;
++            *)
++                _pm_ok=1
++                if command -v microdnf > /dev/null 2>&1; then
++                    # shellcheck disable=SC2086
++                    microdnf install -y --nodocs ${_pm_need} > /dev/null 2>&1 && microdnf clean all > /dev/null 2>&1 || _pm_ok=0
++                elif command -v dnf > /dev/null 2>&1; then
++                    # shellcheck disable=SC2086
++                    dnf install -y --nodocs ${_pm_need} > /dev/null 2>&1 && dnf clean all > /dev/null 2>&1 || _pm_ok=0
++                else
++                    _pm_ok=0
++                fi
++                rm -rf /var/cache/yum /var/cache/dnf 2>/dev/null
++                if [ "${_pm_ok}" = 1 ]; then
++                    pm_say "  ${_pm_need} を導入しました"
++                elif [ "${PERF_PROCPS}" = true ]; then
++                    pm_say "ERROR: ${_pm_need} を導入できませんでした (PERF_PROCPS=true)。リポジトリへの接続を確認してください" >&2
++                    return 1
++                else
++                    pm_say "  WARN: ${_pm_need} を導入できませんでした (リポジトリに接続できない等)。③ は /proc から同じ項目を算出します"
++                fi ;;
++        esac
++    fi
++    for _pm_t in top ps awk mkfifo curl nice tar; do
++        if command -v "${_pm_t}" > /dev/null 2>&1; then pm_say "  ${_pm_t}: $(command -v "${_pm_t}")"; else pm_say "  ${_pm_t}: なし"; fi
++    done
++    _pm_java="$(pm_java_of_jboss 2>/dev/null)" || _pm_java=""
++    pm_say "  java: ${_pm_java:-なし}"
++    for _pm_t in jstat jcmd; do
++        if pm_resolve_tool "${_pm_t}"; then pm_say "  ${_pm_t}: $(pm_tool_desc)"; else pm_say "  ${_pm_t}: なし (② の ${_pm_t} は動きません)"; fi
++    done
++    if [ -n "${_pm_java}" ]; then
++        _pm_mods="$(env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS "${_pm_java}" -XX:-UsePerfData --list-modules 2>/dev/null)"
++        for _pm_t in jdk.jfr jdk.jcmd jdk.compiler; do
++            if printf '%s\n' "${_pm_mods}" | grep -q "^${_pm_t}@"; then pm_say "  module ${_pm_t}: あり"; else pm_say "  module ${_pm_t}: なし"; fi
++        done
++    fi
++    if [ -f "${JBOSS_HOME:-/opt/jboss-eap}/bin/jboss-cli.sh" ]; then
++        pm_say "  jboss-cli.sh: ${JBOSS_HOME:-/opt/jboss-eap}/bin/jboss-cli.sh"
++    else
++        pm_say "  jboss-cli.sh: なし (JBoss EAP 導入前のイメージでは正常。① は実行時に JBOSS_HOME から探します)"
++    fi
++    pm_say "性能試験用メトリクス収集を有効にしました (PERF_METRICS_ENABLED=true)"
++    return 0
++}
++
++PM_COLLECTOR_NAMES="cli jstat jcmd top ps proc"
++
++pm_status() {
++    if ! pm_load_state; then
++        echo "perf-metrics: 実行中の収集が見つかりません (PERF_METRICS_ENABLED=${PERF_METRICS_ENABLED})"
++        return 1
++    fi
++    echo "perf-metrics ${PERF_METRICS_VERSION}"
++    echo "  出力先          : ${PM_OUT}"
++    echo "  作業ディレクトリ: ${PM_W}"
++    echo "  開始            : ${PM_START_TS}"
++    for _pm_c in ${PM_COLLECTOR_NAMES}; do
++        [ -r "${PM_W}/${_pm_c}.pid" ] || continue
++        _pm_p="$(cat "${PM_W}/${_pm_c}.pid")"
++        if kill -0 "${_pm_p}" 2>/dev/null; then _pm_s="実行中"; else _pm_s="停止"; fi
++        echo "  収集 ${_pm_c}: ${_pm_s} (pid=${_pm_p})"
++    done
++    echo "  ファイル (行数 / 最終行の時刻):"
++    for _pm_f in "${PM_OUT}"/*.csv; do
++        [ -f "${_pm_f}" ] || continue
++        case "${_pm_f##*/}" in
++            perf_meta.csv|jfr_*.csv) _pm_lt="-" ;;
++            *) _pm_lt="$(tail -n 1 "${_pm_f}" | cut -d, -f1 | tr -d '"')" ;;
++        esac
++        printf '    %-24s %8s  %s\n' "$(basename "${_pm_f}")" "$(wc -l < "${_pm_f}" | tr -d ' ')" "${_pm_lt}"
++    done
++    if [ -d "${PM_JFR_DIR:-${PM_OUT}/jfr}" ]; then
++        echo "  JFR: $(find "${PM_JFR_DIR:-${PM_OUT}/jfr}" -name '*.jfr' -type f 2>/dev/null | wc -l | tr -d ' ') ファイル ($(du -sh "${PM_JFR_DIR:-${PM_OUT}/jfr}" 2>/dev/null | cut -f1))"
++    fi
++    if [ -s "${PM_OUT}/cpu_env.csv" ]; then
++        echo "  ④ ActiveProcessorCount: $(awk -F, '$5 == "result" { r = $6 } END { gsub(/"/, "", r); print r }' "${PM_OUT}/cpu_env.csv")  (詳細: perf-metrics.sh cpu-check)"
++    fi
++    echo "  直近のログ:"
++    tail -n 5 "${PM_LOG_FILE}" 2>/dev/null | sed 's/^/    /'
++    return 0
++}
++
++pm_cpu_check() {
++    pm_load_state || { echo "perf-metrics: 実行中の収集が見つかりません"; return 1; }
++    [ -s "${PM_OUT}/cpu_env.csv" ] || { echo "まだ判定していません (JBoss の JVM へのアタッチ待ち)。しばらくしてから実行してください"; return 1; }
++    # 最後の JVM の分だけを表示する
++    awk -F, 'NR > 1 { pid = $3 } END { }' "${PM_OUT}/cpu_env.csv" >/dev/null
++    _pm_lp="$(awk -F, 'NR > 1 { p = $3 } END { print p }' "${PM_OUT}/cpu_env.csv")"
++    awk -F, -v p="${_pm_lp}" 'NR > 1 && $3 == p { v = $6; for (i = 7; i < NF; i++) v = v "," $i; gsub(/^"|"$/, "", v); printf "  %-10s %-34s %s\n", $4, $5, v }' "${PM_OUT}/cpu_env.csv"
++}
++
++pm_stop() {
++    pm_load_state || { echo "perf-metrics: 実行中の収集が見つかりません"; return 1; }
++    for _pm_c in ${PM_COLLECTOR_NAMES}; do
++        [ -r "${PM_W}/${_pm_c}.pid" ] || continue
++        _pm_p="$(cat "${PM_W}/${_pm_c}.pid")"
++        if kill -0 "${_pm_p}" 2>/dev/null; then
++            pm_kill_tree "${_pm_p}"
++            echo "停止しました: ${_pm_c} (pid=${_pm_p})"
++        fi
++    done
++    PM_NAME=stop
++    pm_log INFO "perf-metrics.sh stop で収集を停止しました (JFR は JBoss 側で記録を続けます。止めるには jcmd <pid> JFR.stop name=perf-metrics)"
++    echo "JFR は JBoss 側で記録を続けます (終了時に ${PM_JFR_DIR:-${PM_OUT}/jfr} へ保存)。今の内容を保存するには perf-metrics.sh jfr-dump"
++    return 0
++}
++
++pm_jfr_dump() {
++    pm_load_state || { echo "perf-metrics: 実行中の収集が見つかりません"; return 1; }
++    PM_JPID="$(pm_find_jboss_pid)" || { echo "JBoss EAP の JVM が見つかりません"; return 1; }
++    pm_resolve_tool jcmd || { echo "jcmd がありません"; return 1; }
++    mkdir -p "${PM_JFR_DIR}/dump" 2>/dev/null
++    pm_tool_exec "${PM_JPID}" JFR.dump name=perf-metrics "filename=${PM_JFR_DIR}/dump/perf_dump_%p_%t.jfr"
++}
++
++pm_pack() {
++    pm_load_state || { echo "perf-metrics: 出力先が分かりません (PERF_OUTPUT_DIR を指定してください)"; return 1; }
++    if [ -d "${PM_JFR_DIR}" ] && [ "${1:-}" != "no-jfr-csv" ]; then
++        pm_jfr_csv "${PM_JFR_DIR}" || echo "(JFR の CSV 変換は行いませんでした)"
++    fi
++    _pm_par="$(dirname "${PM_OUT}")"
++    _pm_tgz="${_pm_par}/perf_$(basename "${_pm_par}")_$(date '+%Y%m%d_%H%M%S').tar"
++    # .jfr (大きい) は PERF_PACK_JFR=true のときだけ含める (CSV に変換済みのため)
++    _pm_ex=""
++    [ "${PERF_PACK_JFR:-false}" = true ] || _pm_ex="--exclude=*.jfr"
++    if command -v gzip > /dev/null 2>&1; then
++        # shellcheck disable=SC2086
++        tar -C "${_pm_par}" ${_pm_ex} -czf "${_pm_tgz}.gz" "$(basename "${PM_OUT}")" && echo "${_pm_tgz}.gz"
++    else
++        # shellcheck disable=SC2086
++        tar -C "${_pm_par}" ${_pm_ex} -cf "${_pm_tgz}" "$(basename "${PM_OUT}")" && echo "${_pm_tgz}"
++    fi
++}
++
++pm_main() {
++    _pm_cmd="${1:-}"
++    [ "$#" -gt 0 ] && shift
++    PM_SELF="$0"
++    pm_setup_tz
++    case "${_pm_cmd}" in
++        run)
++            case "${1:-}" in
++                cli) pm_run_cli ;;
++                jstat) pm_run_jstat ;;
++                jcmd) pm_run_jcmd ;;
++                top) pm_run_top ;;
++                ps) pm_run_ps ;;
++                proc) pm_run_proc ;;
++                *) echo "usage: perf-metrics.sh run cli|jstat|jcmd|top|ps|proc" >&2; exit 2 ;;
++            esac
++            ;;
++        install) pm_install ;;
++        status) pm_status ;;
++        cpu-check) pm_cpu_check ;;
++        stop) pm_stop ;;
++        pack) pm_pack "$@" ;;
++        jfr-dump) pm_jfr_dump ;;
++        jfr-csv)
++            pm_load_state || { PM_OUT="${PERF_OUTPUT_DIR:-$(pwd)}"; PM_W=""; }
++            pm_jfr_csv "$@"
++            ;;
++        threaddump)
++            pm_load_state || { echo "perf-metrics: 実行中の収集が見つかりません" >&2; exit 1; }
++            PM_NAME=threaddump
++            PM_JPID="$(pm_find_jboss_pid)" || { echo "JBoss EAP の JVM が見つかりません" >&2; exit 1; }
++            pm_resolve_tool jcmd || { echo "jcmd がありません" >&2; exit 1; }
++            pm_threaddump
++            ;;
++        start) perf_metrics_start "$@" ;;
++        version) echo "perf-metrics.sh ${PERF_METRICS_VERSION}" ;;
++        *)
++            echo "usage: perf-metrics.sh status | cpu-check | stop | jfr-dump | jfr-csv | threaddump | pack | install | version" >&2
++            exit 2
++            ;;
++    esac
++}
++
++# 直接実行されたときだけコマンドを処理する (エントリポイントから . で読み込まれたときは
++# 関数の定義だけで終わる)
++case "${0##*/}" in
++    perf-metrics.sh|perf-metrics) pm_main "$@"; exit $? ;;
++esac
++:
+diff --git a/docker/front/Dockerfile b/docker/front/Dockerfile
+--- a/docker/front/Dockerfile
++++ b/docker/front/Dockerfile
+@@ -23,6 +23,15 @@
+ #     --build-arg BASE_IMAGE=myapp-base:latest \
+ #     --build-arg Service_Name=intra-web \
+ #     --build-arg Component_name=intra-web-front \
++#     docker/front
++#
++#   # 性能試験用 (メトリクス収集を有効にする。タグは本番用と分け、Service_Name /
++#   # Component_name は本番と同じ値にする = ログの出力先 (EFS のパス) が本番と同じになる):
++#   docker build -t intra-web-front:perf \
++#     --build-arg BASE_IMAGE=myapp-base:latest \
++#     --build-arg Service_Name=intra-web \
++#     --build-arg Component_name=intra-web-front \
++#     --build-arg PERF_METRICS_ENABLED=true \
+ #     docker/front
+ # =============================================================================
+ ARG BASE_IMAGE=myapp-base:latest
+@@ -81,6 +90,37 @@
+ # リンクの張り先を確認できるようビルドログへ出力 (ビルド時検証)
+ RUN ls -l /webapp/webapp9mf02/ /opt/jboss-eap/standalone/ | grep -E ' logs| log| pdf' || true
+ 
++# --- 4. 性能試験用メトリクス収集 (ビルド引数で有効化 / 無効化) -----------------
++#   --build-arg PERF_METRICS_ENABLED=true  : perf-metrics.sh を残し、起動時に収集を始める
++#                                           (① jboss-cli ② jstat・jcmd・JFR ③ top・ps ④ CPU 数の判定)。
++#   --build-arg PERF_METRICS_ENABLED=false : (既定) perf-metrics.sh を削除する。本番用。
++#   --build-arg PERF_INTERVAL=10           : 取得間隔の既定 (秒)。タスク定義の environment
++#                                           (PERF_INTERVAL・PERF_CLI_INTERVAL など) でも上書きできる。
++#   --build-arg PERF_PROCPS=auto           : top / ps (procps-ng) が無ければ導入を試みる。導入できなく
++#                                           てもビルドは続け、③ は /proc から同じ項目を算出する
++#                                           (true = 導入できなければ失敗させる、false = 導入しない)。
++# 有効かどうかは ENV に焼き込み、エントリポイントが起動時に読む。起動ログ (CloudWatch Logs)
++# に「性能試験用メトリクス収集: 有効」の枠が出れば有効になっている。
++# 出力先: /mnt/logs/<Component_name>/logs/<Service_Name>/mid/<LOG_ID>/perf/
++#         (mid/current/perf から辿れる。readonlyRootFilesystem=true でも書ける EFS 上)
++ARG PERF_METRICS_ENABLED=false
++ARG PERF_INTERVAL=10
++ARG PERF_PROCPS=auto
++ENV PERF_METRICS_ENABLED=${PERF_METRICS_ENABLED} \
++    PERF_INTERVAL=${PERF_INTERVAL}
++RUN case "${PERF_METRICS_ENABLED}" in \
++        true) \
++            test -f /usr/local/bin/perf-metrics.sh \
++                || { echo "ERROR: base イメージに /usr/local/bin/perf-metrics.sh がありません。base を再ビルドしてください" >&2; exit 1; }; \
++            PERF_PROCPS="${PERF_PROCPS}" /usr/local/bin/perf-metrics.sh install ;; \
++        false) \
++            rm -f /usr/local/bin/perf-metrics.sh; \
++            echo "perf-metrics: 無効 (PERF_METRICS_ENABLED=false)。perf-metrics.sh を削除しました" ;; \
++        *) \
++            echo "ERROR: --build-arg PERF_METRICS_ENABLED は true か false で指定してください (指定値: ${PERF_METRICS_ENABLED})" >&2; \
++            exit 1 ;; \
++    esac
++
+ # 実行ユーザーへ戻す (本番ベースイメージのユーザーに合わせること)
+ # USER jboss
+ 
+diff --git a/docker/back/Dockerfile b/docker/back/Dockerfile
+--- a/docker/back/Dockerfile
++++ b/docker/back/Dockerfile
+@@ -20,6 +20,15 @@
+ #     --build-arg BASE_IMAGE=myapp-base:latest \
+ #     --build-arg Service_Name=intra-api \
+ #     --build-arg Component_name=intra-api-back \
++#     docker/back
++#
++#   # 性能試験用 (メトリクス収集を有効にする。タグは本番用と分け、Service_Name /
++#   # Component_name は本番と同じ値にする = ログの出力先 (EFS のパス) が本番と同じになる):
++#   docker build -t intra-api-back:perf \
++#     --build-arg BASE_IMAGE=myapp-base:latest \
++#     --build-arg Service_Name=intra-api \
++#     --build-arg Component_name=intra-api-back \
++#     --build-arg PERF_METRICS_ENABLED=true \
+ #     docker/back
+ # =============================================================================
+ ARG BASE_IMAGE=myapp-base:latest
+@@ -57,6 +66,37 @@
+ # リンクの張り先を確認できるようビルドログへ出力 (ビルド時検証)
+ RUN ls -l /webapp/webapp9mb02/ /opt/jboss-eap/standalone/ | grep -E ' logs| log' || true
+ 
++# --- 3. 性能試験用メトリクス収集 (ビルド引数で有効化 / 無効化) -----------------
++#   --build-arg PERF_METRICS_ENABLED=true  : perf-metrics.sh を残し、起動時に収集を始める
++#                                           (① jboss-cli ② jstat・jcmd・JFR ③ top・ps ④ CPU 数の判定)。
++#   --build-arg PERF_METRICS_ENABLED=false : (既定) perf-metrics.sh を削除する。本番用。
++#   --build-arg PERF_INTERVAL=10           : 取得間隔の既定 (秒)。タスク定義の environment
++#                                           (PERF_INTERVAL・PERF_CLI_INTERVAL など) でも上書きできる。
++#   --build-arg PERF_PROCPS=auto           : top / ps (procps-ng) が無ければ導入を試みる。導入できなく
++#                                           てもビルドは続け、③ は /proc から同じ項目を算出する
++#                                           (true = 導入できなければ失敗させる、false = 導入しない)。
++# 有効かどうかは ENV に焼き込み、エントリポイントが起動時に読む。起動ログ (CloudWatch Logs)
++# に「性能試験用メトリクス収集: 有効」の枠が出れば有効になっている。
++# 出力先: /mnt/logs/<Component_name>/logs/<Service_Name>/mid/<LOG_ID>/perf/
++#         (mid/current/perf から辿れる。readonlyRootFilesystem=true でも書ける EFS 上)
++ARG PERF_METRICS_ENABLED=false
++ARG PERF_INTERVAL=10
++ARG PERF_PROCPS=auto
++ENV PERF_METRICS_ENABLED=${PERF_METRICS_ENABLED} \
++    PERF_INTERVAL=${PERF_INTERVAL}
++RUN case "${PERF_METRICS_ENABLED}" in \
++        true) \
++            test -f /usr/local/bin/perf-metrics.sh \
++                || { echo "ERROR: base イメージに /usr/local/bin/perf-metrics.sh がありません。base を再ビルドしてください" >&2; exit 1; }; \
++            PERF_PROCPS="${PERF_PROCPS}" /usr/local/bin/perf-metrics.sh install ;; \
++        false) \
++            rm -f /usr/local/bin/perf-metrics.sh; \
++            echo "perf-metrics: 無効 (PERF_METRICS_ENABLED=false)。perf-metrics.sh を削除しました" ;; \
++        *) \
++            echo "ERROR: --build-arg PERF_METRICS_ENABLED は true か false で指定してください (指定値: ${PERF_METRICS_ENABLED})" >&2; \
++            exit 1 ;; \
++    esac
++
+ # 実行ユーザーへ戻す (本番ベースイメージのユーザーに合わせること)
+ # USER jboss
+ 

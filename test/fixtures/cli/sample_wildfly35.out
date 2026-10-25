@@ -1,0 +1,664 @@
+PERF_S 7
+PERF_B dsp.ds
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "datasources"),
+            ("data-source" => "ExampleDS"),
+            ("statistics" => "pool")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "ActiveCount" => 12,
+            "AvailableCount" => 14,
+            "AverageBlockingTime" => 1L,
+            "AverageCreationTime" => 16L,
+            "AverageGetTime" => 4L,
+            "AveragePoolTime" => 31L,
+            "AverageUsageTime" => 63L,
+            "BlockingFailureCount" => 0,
+            "CreatedCount" => 12,
+            "DestroyedCount" => 0,
+            "IdleCount" => 6,
+            "InUseCount" => 5,
+            "MaxCreationTime" => 189L,
+            "MaxGetTime" => 193L,
+            "MaxPoolTime" => 11642L,
+            "MaxUsageTime" => 130L,
+            "MaxUsedCount" => 12,
+            "MaxWaitCount" => 0,
+            "MaxWaitTime" => 1L,
+            "TimedOut" => 0,
+            "TotalBlockingTime" => 6L,
+            "TotalCreationTime" => 200L,
+            "TotalGetTime" => 244L,
+            "TotalPoolTime" => 27355L,
+            "TotalUsageTime" => 56617L,
+            "WaitCount" => 0,
+            "XACommitAverageTime" => 0L,
+            "XACommitCount" => 0L,
+            "XACommitMaxTime" => 0L,
+            "XACommitTotalTime" => 0L,
+            "XAEndAverageTime" => 0L,
+            "XAEndCount" => 0L,
+            "XAEndMaxTime" => 0L,
+            "XAEndTotalTime" => 0L,
+            "XAForgetAverageTime" => 0L,
+            "XAForgetCount" => 0L,
+            "XAForgetMaxTime" => 0L,
+            "XAForgetTotalTime" => 0L,
+            "XAPrepareAverageTime" => 0L,
+            "XAPrepareCount" => 0L,
+            "XAPrepareMaxTime" => 0L,
+            "XAPrepareTotalTime" => 0L,
+            "XARecoverAverageTime" => 0L,
+            "XARecoverCount" => 0L,
+            "XARecoverMaxTime" => 0L,
+            "XARecoverTotalTime" => 0L,
+            "XARollbackAverageTime" => 0L,
+            "XARollbackCount" => 0L,
+            "XARollbackMaxTime" => 0L,
+            "XARollbackTotalTime" => 0L,
+            "XAStartAverageTime" => 0L,
+            "XAStartCount" => 0L,
+            "XAStartMaxTime" => 0L,
+            "XAStartTotalTime" => 0L,
+            "statistics-enabled" => true
+        }
+    }]
+}
+PERF_B dsp.xa
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "datasources"),
+            ("xa-data-source" => "ExampleXADS"),
+            ("statistics" => "pool")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "ActiveCount" => 5,
+            "AvailableCount" => 3,
+            "AverageBlockingTime" => 17L,
+            "AverageCreationTime" => 2L,
+            "AverageGetTime" => 6L,
+            "AveragePoolTime" => 63L,
+            "AverageUsageTime" => 60L,
+            "BlockingFailureCount" => 0,
+            "CreatedCount" => 5,
+            "DestroyedCount" => 0,
+            "IdleCount" => 3,
+            "InUseCount" => 2,
+            "MaxCreationTime" => 7L,
+            "MaxGetTime" => 54L,
+            "MaxPoolTime" => 13365L,
+            "MaxUsageTime" => 71L,
+            "MaxUsedCount" => 5,
+            "MaxWaitCount" => 3,
+            "MaxWaitTime" => 54L,
+            "TimedOut" => 0,
+            "TotalBlockingTime" => 120L,
+            "TotalCreationTime" => 11L,
+            "TotalGetTime" => 144L,
+            "TotalPoolTime" => 30382L,
+            "TotalUsageTime" => 31360L,
+            "WaitCount" => 7,
+            "XACommitAverageTime" => 0L,
+            "XACommitCount" => 515L,
+            "XACommitMaxTime" => 6L,
+            "XACommitTotalTime" => 50L,
+            "XAEndAverageTime" => 0L,
+            "XAEndCount" => 515L,
+            "XAEndMaxTime" => 1L,
+            "XAEndTotalTime" => 2L,
+            "XAForgetAverageTime" => 0L,
+            "XAForgetCount" => 0L,
+            "XAForgetMaxTime" => 0L,
+            "XAForgetTotalTime" => 0L,
+            "XAPrepareAverageTime" => 0L,
+            "XAPrepareCount" => 0L,
+            "XAPrepareMaxTime" => 0L,
+            "XAPrepareTotalTime" => 0L,
+            "XARecoverAverageTime" => 0L,
+            "XARecoverCount" => 0L,
+            "XARecoverMaxTime" => 0L,
+            "XARecoverTotalTime" => 0L,
+            "XARollbackAverageTime" => 0L,
+            "XARollbackCount" => 0L,
+            "XARollbackMaxTime" => 0L,
+            "XARollbackTotalTime" => 0L,
+            "XAStartAverageTime" => 0L,
+            "XAStartCount" => 517L,
+            "XAStartMaxTime" => 1L,
+            "XAStartTotalTime" => 4L,
+            "statistics-enabled" => true
+        }
+    }]
+}
+PERF_B dsa.ds.max-pool-size
+{
+    "outcome" => "success",
+    "result" => []
+}
+PERF_B dsa.xa.blocking-timeout-wait-millis
+{
+    "outcome" => "success",
+    "result" => []
+}
+PERF_B web.stat
+{
+    "outcome" => "success",
+    "result" => "true"
+}
+PERF_B web.http
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "undertow"),
+            ("server" => "default-server"),
+            ("http-listener" => "default")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "allow-encoded-slash" => false,
+            "allow-equals-in-cookie-value" => false,
+            "allow-unescaped-characters-in-url" => false,
+            "always-set-keep-alive" => true,
+            "buffer-pipelined-data" => false,
+            "buffer-pool" => "default",
+            "bytes-received" => 368686L,
+            "bytes-sent" => 829990L,
+            "certificate-forwarding" => false,
+            "decode-url" => true,
+            "disallowed-methods" => ["TRACE"],
+            "enable-http2" => true,
+            "enabled" => true,
+            "error-count" => 0L,
+            "http2-enable-push" => true,
+            "http2-header-table-size" => 4096,
+            "http2-initial-window-size" => 65535,
+            "http2-max-concurrent-streams" => undefined,
+            "http2-max-frame-size" => 16384,
+            "http2-max-header-list-size" => undefined,
+            "max-buffered-request-size" => 16384,
+            "max-connections" => undefined,
+            "max-cookies" => 200,
+            "max-header-size" => 1048576,
+            "max-headers" => 200,
+            "max-parameters" => 1000,
+            "max-post-size" => 10485760L,
+            "max-processing-time" => 0L,
+            "no-request-timeout" => 60000,
+            "processing-time" => 0L,
+            "proxy-address-forwarding" => false,
+            "proxy-protocol" => false,
+            "read-timeout" => 90000,
+            "receive-buffer" => undefined,
+            "record-request-start-time" => false,
+            "redirect-socket" => "https",
+            "request-count" => 3106L,
+            "request-parse-timeout" => undefined,
+            "require-host-http11" => false,
+            "resolve-peer-address" => false,
+            "rfc6265-cookie-validation" => false,
+            "secure" => false,
+            "send-buffer" => undefined,
+            "socket-binding" => "http",
+            "tcp-backlog" => 10000,
+            "tcp-keep-alive" => undefined,
+            "url-charset" => "UTF-8",
+            "worker" => "default",
+            "write-timeout" => 90000
+        }
+    }]
+}
+PERF_B web.https
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "undertow"),
+            ("server" => "default-server"),
+            ("https-listener" => "https")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "allow-encoded-slash" => false,
+            "allow-equals-in-cookie-value" => false,
+            "allow-unescaped-characters-in-url" => false,
+            "always-set-keep-alive" => true,
+            "buffer-pipelined-data" => false,
+            "buffer-pool" => "default",
+            "bytes-received" => 0L,
+            "bytes-sent" => 0L,
+            "certificate-forwarding" => false,
+            "decode-url" => true,
+            "disallowed-methods" => ["TRACE"],
+            "enable-http2" => true,
+            "enable-spdy" => false,
+            "enabled" => true,
+            "enabled-cipher-suites" => undefined,
+            "enabled-protocols" => undefined,
+            "error-count" => 0L,
+            "http2-enable-push" => true,
+            "http2-header-table-size" => 4096,
+            "http2-initial-window-size" => 65535,
+            "http2-max-concurrent-streams" => undefined,
+            "http2-max-frame-size" => 16384,
+            "http2-max-header-list-size" => undefined,
+            "max-buffered-request-size" => 16384,
+            "max-connections" => undefined,
+            "max-cookies" => 200,
+            "max-header-size" => 1048576,
+            "max-headers" => 200,
+            "max-parameters" => 1000,
+            "max-post-size" => 10485760L,
+            "max-processing-time" => 0L,
+            "no-request-timeout" => 60000,
+            "processing-time" => 0L,
+            "proxy-address-forwarding" => false,
+            "proxy-protocol" => false,
+            "read-timeout" => 90000,
+            "receive-buffer" => undefined,
+            "record-request-start-time" => false,
+            "request-count" => 0L,
+            "request-parse-timeout" => undefined,
+            "require-host-http11" => false,
+            "resolve-peer-address" => false,
+            "rfc6265-cookie-validation" => false,
+            "secure" => false,
+            "security-realm" => undefined,
+            "send-buffer" => undefined,
+            "socket-binding" => "https",
+            "ssl-context" => "applicationSSC",
+            "ssl-session-cache-size" => undefined,
+            "ssl-session-timeout" => undefined,
+            "tcp-backlog" => 10000,
+            "tcp-keep-alive" => undefined,
+            "url-charset" => "UTF-8",
+            "verify-client" => "NOT_REQUESTED",
+            "worker" => "default",
+            "write-timeout" => 90000
+        }
+    }]
+}
+PERF_B web.ajp
+{
+    "outcome" => "success",
+    "result" => []
+}
+PERF_B ses.dep
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("deployment" => "perftest.war"),
+            ("subsystem" => "undertow")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "active-sessions" => 3230,
+            "context-root" => "/perftest",
+            "expired-sessions" => 0,
+            "highest-session-count" => 3230,
+            "max-active-sessions" => -1,
+            "rejected-sessions" => 0,
+            "server" => "default-server",
+            "session-avg-alive-time" => 0,
+            "session-max-alive-time" => 0,
+            "sessions-created" => 3230,
+            "virtual-host" => "default-host",
+            "servlet" => undefined,
+            "websocket" => undefined
+        }
+    }]
+}
+PERF_B ses.sub
+{
+    "outcome" => "success",
+    "result" => []
+}
+PERF_B iow
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "io"),
+            ("worker" => "default")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "busy-task-thread-count" => 0,
+            "core-pool-size" => 2,
+            "io-thread-count" => 8,
+            "io-threads" => "8",
+            "max-pool-size" => 64,
+            "queue-size" => 0,
+            "shutdown-requested" => false,
+            "stack-size" => "0",
+            "task-core-threads" => "2",
+            "task-keepalive" => "60000",
+            "task-max-threads" => "64",
+            "outbound-bind-address" => undefined,
+            "server" => {
+                "/127.0.0.1:8080" => undefined,
+                "/127.0.0.1:8443" => undefined
+            }
+        }
+    }]
+}
+PERF_B ios
+{
+    "outcome" => "success",
+    "result" => [
+        {
+            "address" => [
+                ("subsystem" => "io"),
+                ("worker" => "default"),
+                ("server" => "/127.0.0.1:8080")
+            ],
+            "outcome" => "success",
+            "result" => {
+                "connection-count" => 0,
+                "connection-limit-high-water-mark" => 2147483647,
+                "connection-limit-low-water-mark" => 2147483647
+            },
+            "rolled-back" => undefined
+        },
+        {
+            "address" => [
+                ("subsystem" => "io"),
+                ("worker" => "default"),
+                ("server" => "/127.0.0.1:8443")
+            ],
+            "outcome" => "success",
+            "result" => {
+                "connection-count" => 0,
+                "connection-limit-high-water-mark" => 2147483647,
+                "connection-limit-low-water-mark" => 2147483647
+            }
+        }
+    ]
+}
+PERF_B tpe.ejb
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "ejb3"),
+            ("thread-pool" => "default")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "active-count" => 0,
+            "completed-task-count" => 0L,
+            "core-threads" => undefined,
+            "current-thread-count" => 0,
+            "keepalive-time" => {
+                "time" => 60L,
+                "unit" => "SECONDS"
+            },
+            "largest-thread-count" => 0,
+            "max-threads" => 10,
+            "name" => "default",
+            "queue-size" => 0,
+            "rejected-count" => 0,
+            "task-count" => 0L,
+            "thread-factory" => undefined
+        }
+    }]
+}
+PERF_B tpe.ee
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "ee"),
+            ("managed-executor-service" => "default")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "active-thread-count" => 0,
+            "completed-task-count" => 0L,
+            "context-service" => "default",
+            "core-threads" => undefined,
+            "current-queue-size" => 0,
+            "hung-task-termination-period" => 0L,
+            "hung-task-threshold" => 60000L,
+            "hung-thread-count" => 0,
+            "jndi-name" => "java:jboss/ee/concurrency/executor/default",
+            "keepalive-time" => 5000L,
+            "long-running-tasks" => false,
+            "max-thread-count" => 0,
+            "max-threads" => undefined,
+            "queue-length" => undefined,
+            "reject-policy" => "ABORT",
+            "task-count" => 0L,
+            "thread-count" => 0,
+            "thread-factory" => undefined,
+            "thread-priority" => 5
+        }
+    }]
+}
+PERF_B tpe.ees
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "ee"),
+            ("managed-scheduled-executor-service" => "default")
+        ],
+        "outcome" => "success",
+        "result" => {
+            "active-thread-count" => 0,
+            "completed-task-count" => 0L,
+            "context-service" => "default",
+            "core-threads" => undefined,
+            "current-queue-size" => 0,
+            "hung-task-termination-period" => 0L,
+            "hung-task-threshold" => 60000L,
+            "hung-thread-count" => 0,
+            "jndi-name" => "java:jboss/ee/concurrency/scheduler/default",
+            "keepalive-time" => 3000L,
+            "long-running-tasks" => false,
+            "max-thread-count" => 0,
+            "reject-policy" => "ABORT",
+            "task-count" => 0L,
+            "thread-count" => 0,
+            "thread-factory" => undefined,
+            "thread-priority" => 5
+        }
+    }]
+}
+PERF_B tx
+{
+    "outcome" => "success",
+    "result" => {
+        "default-timeout" => 300,
+        "enable-statistics" => "true",
+        "enable-tsm-status" => false,
+        "hornetq-store-enable-async-io" => false,
+        "jdbc-action-store-drop-table" => false,
+        "jdbc-action-store-table-prefix" => undefined,
+        "jdbc-communication-store-drop-table" => false,
+        "jdbc-communication-store-table-prefix" => undefined,
+        "jdbc-state-store-drop-table" => false,
+        "jdbc-state-store-table-prefix" => undefined,
+        "jdbc-store-datasource" => undefined,
+        "journal-store-enable-async-io" => false,
+        "jts" => false,
+        "maximum-timeout" => 31536000,
+        "node-identifier" => "1",
+        "object-store-path" => "tx-object-store",
+        "object-store-relative-to" => "jboss.server.data.dir",
+        "process-id-socket-binding" => undefined,
+        "process-id-socket-max-ports" => 10,
+        "process-id-uuid" => true,
+        "recovery-listener" => false,
+        "socket-binding" => "txn-recovery-environment",
+        "stale-transaction-time" => 600,
+        "statistics-enabled" => "true",
+        "status-socket-binding" => "txn-status-manager",
+        "use-hornetq-store" => false,
+        "use-jdbc-store" => false,
+        "use-journal-store" => false,
+        "average-commit-time" => 13770L,
+        "number-of-aborted-transactions" => 0L,
+        "number-of-application-rollbacks" => 0L,
+        "number-of-committed-transactions" => 808L,
+        "number-of-heuristics" => 0L,
+        "number-of-inflight-transactions" => 0L,
+        "number-of-nested-transactions" => 0L,
+        "number-of-resource-rollbacks" => 0L,
+        "number-of-system-rollbacks" => 0L,
+        "number-of-timed-out-transactions" => 0L,
+        "number-of-transactions" => 808L,
+        "commit-markable-resource" => undefined,
+        "log-store" => {"log-store" => undefined}
+    }
+}
+PERF_B srv.state
+{
+    "outcome" => "success",
+    "result" => "running"
+}
+PERF_B srv.suspend
+{
+    "outcome" => "success",
+    "result" => "RUNNING"
+}
+PERF_B mem
+{
+    "outcome" => "success",
+    "result" => {
+        "heap-memory-usage" => {
+            "init" => 67108864L,
+            "used" => 196294416L,
+            "committed" => 460324864L,
+            "max" => 536870912L
+        },
+        "non-heap-memory-usage" => {
+            "init" => 7667712L,
+            "used" => 121533304L,
+            "committed" => 125894656L,
+            "max" => -1L
+        },
+        "object-name" => "java.lang:type=Memory",
+        "object-pending-finalization-count" => 0,
+        "verbose" => false
+    }
+}
+PERF_B cls
+{
+    "outcome" => "success",
+    "result" => {
+        "loaded-class-count" => 15487,
+        "object-name" => "java.lang:type=ClassLoading",
+        "total-loaded-class-count" => 15487L,
+        "unloaded-class-count" => 0L,
+        "verbose" => false
+    }
+}
+PERF_B buf
+{
+    "outcome" => "success",
+    "result" => [
+        {
+            "address" => [
+                ("core-service" => "platform-mbean"),
+                ("type" => "buffer-pool"),
+                ("name" => "mapped")
+            ],
+            "outcome" => "success",
+            "result" => {
+                "count" => 0L,
+                "memory-used" => 0L,
+                "name" => "mapped",
+                "object-name" => "java.nio:type=BufferPool,name=mapped",
+                "total-capacity" => 0L
+            },
+            "rolled-back" => undefined
+        },
+        {
+            "address" => [
+                ("core-service" => "platform-mbean"),
+                ("type" => "buffer-pool"),
+                ("name" => "direct")
+            ],
+            "outcome" => "success",
+            "result" => {
+                "count" => 84L,
+                "memory-used" => 2004777L,
+                "name" => "direct",
+                "object-name" => "java.nio:type=BufferPool,name=direct",
+                "total-capacity" => 2004777L
+            },
+            "rolled-back" => undefined
+        },
+        {
+            "address" => [
+                ("core-service" => "platform-mbean"),
+                ("type" => "buffer-pool"),
+                ("name" => "mapped_-_'non-volatile_memory'")
+            ],
+            "outcome" => "success",
+            "result" => {
+                "count" => 0L,
+                "memory-used" => 0L,
+                "name" => "mapped - 'non-volatile memory'",
+                "object-name" => "java.nio:type=BufferPool,name=mapped - 'non-volatile memory'",
+                "total-capacity" => 0L
+            }
+        }
+    ]
+}
+PERF_B os
+{
+    "outcome" => "success",
+    "result" => {
+        "name" => "Linux",
+        "arch" => "amd64",
+        "version" => "5.15.153.1-microsoft-standard-WSL2",
+        "available-processors" => 4,
+        "system-load-average" => 1.34,
+        "object-name" => "java.lang:type=OperatingSystem"
+    }
+}
+PERF_B thr.peak
+{
+    "outcome" => "success",
+    "result" => 145
+}
+PERF_B thr.started
+{
+    "outcome" => "success",
+    "result" => 148L
+}
+PERF_B thr.count
+{
+    "outcome" => "success",
+    "result" => 70
+}
+PERF_B rc
+{
+    "outcome" => "success",
+    "result" => 0
+}
+PERF_B dsa.ds.jndi-name
+{
+    "outcome" => "success",
+    "result" => [{
+        "address" => [
+            ("subsystem" => "datasources"),
+            ("data-source" => "ExampleDS")
+        ],
+        "outcome" => "success",
+        "result" => "java:jboss/datasources/ExampleDS"
+    }]
+}
+PERF_B thr.daemon
+PERF_F thr.daemon
+PERF_E 7

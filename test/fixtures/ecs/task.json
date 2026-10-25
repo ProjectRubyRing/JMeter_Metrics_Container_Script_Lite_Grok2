@@ -1,0 +1,24 @@
+{
+  "Cluster": "arn:aws:ecs:ap-northeast-1:123456789012:cluster/perf-cluster",
+  "TaskARN": "arn:aws:ecs:ap-northeast-1:123456789012:task/perf-cluster/7c3f0c3b4b2c4f6e9b8c3d2a1e0f9a8b",
+  "Family": "intra-web",
+  "Revision": "42",
+  "ServiceName": "intra-web",
+  "DesiredStatus": "RUNNING",
+  "KnownStatus": "RUNNING",
+  "Limits": { "CPU": 2, "Memory": 4096 },
+  "PullStartedAt": "2026-10-24T01:00:00.123456789Z",
+  "AvailabilityZone": "ap-northeast-1c",
+  "LaunchType": "FARGATE",
+  "EphemeralStorageMetrics": { "Utilized": 261, "Reserved": 20496 },
+  "Containers": [
+    { "DockerId": "7c3f0c3b4b2c4f6e9b8c3d2a1e0f9a8b-1111111111", "Name": "intra-web-front", "Image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/intra-web-front:perf",
+      "Labels": { "com.amazonaws.ecs.container-name": "intra-web-front" }, "DesiredStatus": "RUNNING", "KnownStatus": "RUNNING",
+      "Limits": { "CPU": 2, "Memory": 2048 }, "Type": "NORMAL", "Networks": [ { "NetworkMode": "awsvpc", "IPv4Addresses": [ "10.0.1.23" ] } ] },
+    { "DockerId": "7c3f0c3b4b2c4f6e9b8c3d2a1e0f9a8b-2222222222", "Name": "intra-web-back", "Image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/intra-web-back:perf",
+      "DesiredStatus": "RUNNING", "KnownStatus": "RUNNING", "Limits": { "CPU": 2, "Memory": 1536 }, "Type": "NORMAL" },
+    { "DockerId": "7c3f0c3b4b2c4f6e9b8c3d2a1e0f9a8b-3333333333", "Name": "cloudwatch-agent", "Image": "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest",
+      "DesiredStatus": "RUNNING", "KnownStatus": "RUNNING", "Limits": { "CPU": 2, "Memory": 256 }, "Type": "NORMAL" }
+  ],
+  "ClockDrift": { "ClockErrorBound": 0.5, "ReferenceTimestamp": "2026-10-24T01:00:00Z", "ClockSynchronizationStatus": "SYNCHRONIZED" }
+}

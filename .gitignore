@@ -1,0 +1,8 @@
+# patches/make_patches.py の作業ディレクトリ
+patches/_work/
+# レポートの出力・Excel の一時ファイル
+*.xlsx
+~$*
+# Python
+__pycache__/
+*.pyc

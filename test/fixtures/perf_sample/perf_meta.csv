@@ -1,0 +1,68 @@
+perf,version,"3.0.0"
+perf,start_time,"2026-10-24 23:11:40"
+perf,start_epoch,"1792851100"
+perf,utc_offset,"+0900"
+perf,output_dir,"/mnt/logs/front/logs/intra-web/mid/20261024141140-6jlezcax/perf"
+perf,work_dir,"/tmp/perf-metrics-front"
+perf,collectors,"cli jstat jcmd top ps proc"
+perf,cli_interval,"5"
+perf,jstat_interval,"5"
+perf,jcmd_interval,"15"
+perf,jfr_interval,"5"
+perf,top_interval,"5"
+perf,ps_interval,"5"
+perf,proc_interval,"5"
+perf,jfr_mode,"startup"
+perf,jfr_note,"JBoss の起動時から記録 (統計イベント 5 秒間隔、settings=default、最大 24h / 1g)"
+perf,nmt,"-XX:NativeMemoryTracking=summary"
+perf,threaddump,"summary"
+perf,top_threads,"10"
+perf,statistics_opts,"-Dwildfly.datasources.statistics-enabled=true -Dwildfly.undertow.statistics-enabled=true -Dwildfly.transactions.statistics-enabled=true"
+perf,prepend_java_opts,"-XX:StartFlightRecording:name=perf-metrics,settings=default,jdk.CPULoad#period=5s,jdk.ThreadCPULoad#period=5s,jdk.JavaThreadStatistics#period=5s,jdk.ClassLoadingStatistics#period=5s,jdk.CompilerStatistics#period=5s,jdk.ExceptionStatistics#period=5s,jdk.ResidentSetSize#period=5s,jdk.DirectBufferStatistics#period=5s,jdk.CodeCacheStatistics#period=5s,jdk.ThreadContextSwitchRate#period=5s,jdk.ContainerCPUThrottling#period=5s,jdk.NativeMemoryUsage#period=5s,jdk.NativeMemoryUsageTotal#period=5s,disk=true,maxage=24h,maxsize=1g,filename=/mnt/logs/front/logs/intra-web/mid/20261024141140-6jlezcax/perf/jfr/perf_%p_%t.jfr,dumponexit=true -XX:FlightRecorderOptions:repository=/mnt/logs/front/logs/intra-web/mid/20261024141140-6jlezcax/perf/jfr/repo,preserve-repository=true -XX:NativeMemoryTracking=summary"
+container,hostname,"perf-e2e-host"
+container,service_name,"intra-web"
+container,component_name,"front"
+container,component_role,"front"
+container,log_id,"20261024141140-6jlezcax"
+container,jboss_home,"/opt/jboss-eap"
+container,cpus_online,"4"
+container,mem_total_kb,"4014980"
+container,os,"Red Hat Enterprise Linux 9.8 (Plow)"
+container,command,"/opt/jboss-eap/bin/standalone.sh -Djboss.server.log.dir=/mnt/logs/front/logs/intra-web/mid/20261024141140-6jlezcax -b 0.0.0.0 -bmanagement 0.0.0.0 -c standalone.xml -Djavax.net.ssl.truststore= -Djavax.net.ssl.trustStorePassword=******** -Djavax.net.ssl.trustStoreType=JKS "
+ecs,Cluster,"arn:aws:ecs:ap-northeast-1:123456789012:cluster/perf"
+ecs,ServiceName,"intra-web"
+ecs,TaskARN,"arn:aws:ecs:ap-northeast-1:123456789012:task/perf/0123456789abcdef"
+ecs,Family,"intra-web-perf"
+ecs,Revision,"7"
+ecs,AvailabilityZone,"ap-northeast-1a"
+ecs,LaunchType,"FARGATE"
+ecs,Limits.CPU,"1"
+ecs,Limits.Memory,"4096"
+ecs,container.Name,"intra-web-front"
+ecs,container.Limits.CPU,"512"
+ecs,container.Limits.Memory,"2048"
+ecs,container.Image,"intra-web-front:perf"
+os,top_source,"/proc (top がありません)"
+os,ps_source,"/proc (ps がありません)"
+os,proc_sources,"cpu.stat=/sys/fs/cgroup/cpu/cpu.stat pressure=なし"
+jvm,jcmd_command,"/usr/lib/jvm/java-21-openjdk-21.0.12.1.1-1.2.el9.x86_64/bin/jcmd"
+cli,controller,"remote+http://127.0.0.1:9990"
+jvm,jstat_command,"/usr/lib/jvm/java-21-openjdk-21.0.12.1.1-1.2.el9.x86_64/bin/java -m jdk.jcmd/sun.tools.jstat.Jstat"
+jvm,jstat_option,"-perfgc"
+jvm,version,"OpenJDK 64-Bit Server VM version 21.0.12.1+1-LTS"
+jvm,pid,"750"
+jfr,state,"running (startup)"
+jboss,product-name,WildFly
+jboss,product-version,35.0.1.Final
+jboss,release-version,27.0.1.Final
+jboss,server-name,perf-e2e-host
+jboss,launch-type,STANDALONE
+jboss,running-mode,NORMAL
+jboss,config-file,/opt/jboss-eap/standalone/configuration/standalone.xml
+jboss,node-name,perf-e2e-host
+jboss,vm-name,OpenJDK 64-Bit Server VM
+jboss,vm-vendor,"Red Hat, Inc."
+jboss,vm-version,21.0.12.1+1-LTS
+jboss,jvm-start-time,1792851101487
+jboss,available-processors,4
+cli,ds_stats_enabled_at_runtime,"2026-10-24 23:11:51"

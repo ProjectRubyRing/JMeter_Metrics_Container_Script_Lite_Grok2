@@ -1,0 +1,4 @@
+rank,kind,target,count,total_ms,max_ms,bytes
+1,socket-read,localhost:8080,3904,158986.037,147.674,1042368
+2,file-read,/opt/jboss-eap/modules/system/layers/base/org/wildfly/extension/microprofile/config-smallrye/main/wildfly-microprofile-config-smallrye-35.0.1.Final.jar,1,31.188,31.188,5861
+3,file-read,/opt/jboss-eap/modules/system/layers/base/org/jboss/as/ejb3/main/wildfly-ejb3-35.0.1.Final.jar,1,22.683,22.683,30

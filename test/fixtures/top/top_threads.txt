@@ -1,0 +1,17 @@
+top - 23:01:26 up 0 min,  1 user,  load average: 0.06, 0.01, 0.00
+Threads:   1 total,   0 running,   1 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 22.4 us,  6.9 sy,  0.0 ni, 65.5 id,  5.2 wa,  0.0 hi,  0.0 si,  0.0 st
+MiB Mem :   3920.9 total,   3090.3 free,    435.7 used,    394.9 buff/cache
+MiB Swap:      0.0 total,      0.0 free,      0.0 used.   3273.4 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+      1 root      20   0  100308  11012   8156 S   0.0   0.3   0:00.27 systemd
+
+top - 23:01:27 up 0 min,  1 user,  load average: 0.06, 0.01, 0.00
+Threads:   1 total,   0 running,   1 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 16.9 us,  6.1 sy,  0.0 ni, 68.9 id,  7.6 wa,  0.0 hi,  0.5 si,  0.0 st
+MiB Mem :   3920.9 total,   3090.3 free,    435.7 used,    394.9 buff/cache
+MiB Swap:      0.0 total,      0.0 free,      0.0 used.   3273.4 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+      1 root      20   0  100308  11012   8156 S   0.0   0.3   0:00.27 systemd

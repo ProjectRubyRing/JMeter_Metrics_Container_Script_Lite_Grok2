@@ -1,0 +1,5 @@
+rank,kind,operation,count,total_ms,max_ms
+1,vm-operation,G1CollectForAllocation (safepoint),10,132.598,18.162
+2,vm-operation,G1PauseRemark (safepoint),4,54.093,19.846
+3,vm-operation,HandshakeAllThreads,1,11.142,11.142
+4,safepoint,safepoint,1,10.641,10.641
